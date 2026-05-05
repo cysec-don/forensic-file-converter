@@ -276,7 +276,7 @@ class DiskImageHandler:
 
         # Forensic → qemu formats: strip header first, then qemu-img
         # Only for DUMP, LIME (EWF/AFF have their own handlers above)
-        if src_fmt in forensic_formats and tgt_fmt in _QEMU_FORMATS:
+        if src_fmt in _FORENSIC_FORMATS and tgt_fmt in _QEMU_FORMATS:
             return self._forensic_to_qemu(input_path, output_path, src_fmt, tgt_fmt)
 
         raise NotImplementedError(
