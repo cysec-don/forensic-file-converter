@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/Python-3.10+-blue.svg" alt="Python 3.10+">
   <img src="https://img.shields.io/badge/Tests-199%20passed-brightgreen.svg" alt="199 tests passing">
-  <img src="https://img.shields.io/badge/License-MIT-green.svg" alt="MIT License">
+  <img src="https://img.shields.io/badge/License-Apache%202.0-blue.svg" alt="Apache 2.0 License">
   <img src="https://img.shields.io/badge/Formats-27+-orange.svg" alt="27+ formats">
 </p>
 
@@ -555,15 +555,44 @@ Contributions are welcome! Here's how to get started:
 
 ## License
 
-MIT License
+Copyright 2024 Cysec Don (cysecdon@gmail.com)
 
-Copyright (c) 2024 Cysec Don
+Licensed under the **Apache License, Version 2.0** (the "License"); you may not use this software except in compliance with the License. You may obtain a copy of the License at:
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+- [LICENSE](LICENSE) — Full Apache 2.0 license text
+- [NOTICE](NOTICE) — Attribution and third-party acknowledgement requirements
+- http://www.apache.org/licenses/LICENSE-2.0
 
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+### Strong Attribution Requirement
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+This project uses a **NOTICE file** that imposes mandatory attribution requirements in addition to the standard Apache 2.0 terms. In summary:
+
+- **Visible credit** — Any derivative work, fork, or redistribution must display the following attribution prominently (e.g., in an About dialog, README, startup banner, or documentation landing page):
+
+  > *"Based on Forensic File Converter by Cysec Don — https://github.com/cysec-don/forensic-file-converter"*
+
+- **Documentation credit** — All documentation and marketing materials for derivative works must include:
+
+  > *"Powered by Forensic File Converter (Cysec Don)"*
+
+- **Source code attribution** — Modified source files must retain the original copyright notice and include a comment near the top of the file indicating the original source:
+
+  ```python
+  # Original source: Forensic File Converter by Cysec Don
+  # https://github.com/cysec-don/forensic-file-converter
+  ```
+
+- **Fork naming** — Public forks must not use the name "Forensic File Converter" as their primary project name without written permission. Use a distinguishing name such as *"Forensic File Converter (Fork by [Name])"* or a completely different name with attribution.
+
+- **Commercial use** — Commercial use is permitted provided all attribution requirements are met. Removing attribution notices to claim sole authorship of the original Work is strictly prohibited.
+
+- **License preservation** — Both the LICENSE and NOTICE files must be included in all copies or substantial portions of the Software.
+
+See the [NOTICE](NOTICE) file for the complete and authoritative attribution requirements.
+
+### Third-Party Tools
+
+This software may optionally invoke external tools (qemu-img, 7z, unrar, cabextract, dmg2img, genisoimage, xorriso, libewf, AFFLIB) when available on the system. These tools are **not included** with this software and are each subject to their own respective licenses. See the [NOTICE](NOTICE) file for the full list of third-party acknowledgements.
 
 ---
 

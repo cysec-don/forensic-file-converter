@@ -1,0 +1,73 @@
+Forensic File Converter
+Copyright 2024 Cysec Don (cysecdon@gmail.com)
+
+This product includes software developed by Cysec Don
+(https://github.com/cysec-don).
+
+================================================================================
+
+ATTRIBUTION REQUIREMENT
+
+This software is licensed under the Apache License, Version 2.0.
+In addition to the requirements of that license, the following attribution
+requirements apply:
+
+1. VISIBLE ATTRIBUTION IN DERIVATIVE WORKS
+   Any derivative work, fork, redistribution, or software that incorporates
+   any portion of this Work must display the following attribution in a
+   prominent location visible to users (such as an "About" dialog, startup
+   banner, README file, or documentation landing page):
+
+       "Based on Forensic File Converter by Cysec Don
+        https://github.com/cysec-don/forensic-file-converter"
+
+2. ATTRIBUTION IN DOCUMENTATION
+   All documentation, websites, marketing materials, or promotional content
+   for derivative works must include the following credit:
+
+       "Powered by Forensic File Converter (Cysec Don)"
+
+3. SOURCE CODE ATTRIBUTION
+   All source code files derived from or incorporating code from this Work
+   must retain the original copyright notice and must include a comment
+   near the top of each modified file indicating the original source:
+
+       # Original source: Forensic File Converter by Cysec Don
+       # https://github.com/cysec-don/forensic-file-converter
+
+4. LICENSE PRESERVATION
+   This NOTICE file must be included in all copies or substantial portions
+   of the Software and any derivative works.
+
+5. COMMERCIAL USE
+   Commercial use is permitted under the terms of the Apache License 2.0,
+   provided that all attribution requirements in this NOTICE file are met.
+   Removal of attribution notices for the purpose of claiming sole authorship
+   of the original Work is strictly prohibited.
+
+6. FORK NAMING
+   Forks of this project that are publicly distributed must not use the name
+   "Forensic File Converter" as their primary project name without written
+   permission from the original author. Forks should use a distinguishing
+   name such as "Forensic File Converter (Fork by [Name])" or a completely
+   different name with attribution as specified above.
+
+================================================================================
+
+Third-Party Acknowledgements
+
+This software may invoke the following optional external tools when available
+on the system. These tools are NOT included with this software and are subject
+to their own respective licenses:
+
+- qemu-img (QEMU, GPL-2.0) — https://www.qemu.org/
+- 7z / p7zip (LGPL-2.1) — https://7-zip.org/
+- unrar (freeware) — https://www.rarlab.com/
+- cabextract (GPL-3.0) — https://www.cabextract.org.uk/
+- dmg2img (GPL-2.0) — https://vu1tur.eu.org/tools/
+- genisoimage / mkisofs / xorriso (GPL-2.0+)
+- libewf / ewfexport / ewfacquire (LGPL-3.0) — https://github.com/libyal/libewf
+- afflib / affcat / affconvert (BSD-like) — https://github.com/sshock/AFFLIB
+
+This software uses only the Python standard library for core operations.
+No third-party Python packages are required.

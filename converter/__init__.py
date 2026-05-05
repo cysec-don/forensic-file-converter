@@ -4,6 +4,10 @@ Forensic File Converter
 A professional-grade Python tool for converting between archive/compression
 formats, disk image formats, and forensic image formats.
 
+Copyright 2024 Cysec Don (cysecdon@gmail.com)
+Licensed under the Apache License, Version 2.0.
+See LICENSE and NOTICE files for attribution requirements.
+
 Author: Cysec Don | cysecdon@gmail.com
 
 Architecture:
