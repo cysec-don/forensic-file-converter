@@ -2,7 +2,7 @@
 Command-Line Interface
 ======================
 
-Entry point for the universal converter tool.
+Entry point for the Forensic File Converter tool.
 
 Modes of operation
 ------------------
@@ -65,9 +65,10 @@ def _build_parser() -> argparse.ArgumentParser:
         prog="converter",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=textwrap.dedent("""\
-            Universal File Converter
+            Forensic File Converter
             ========================
-            Convert between archive/compression formats and disk image formats.
+            Convert between archive/compression formats, disk image formats,
+            and forensic image formats.
 
             Supported archive formats:
               .zip  .rar  .7z  .tar  .tar.gz  .tar.bz2  .tar.xz
@@ -75,6 +76,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
             Supported disk image formats:
               .qcow2  .vmdk  .vhd  .vhdx  .iso  .img  .raw  .dd  .bin  .dmg
+
+            Supported forensic formats:
+              .dump  .dmp  .lime  .e01  .ex01  .aff
         """),
         epilog=textwrap.dedent("""\
             Examples:

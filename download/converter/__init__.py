@@ -1,8 +1,10 @@
 """
-Universal File Converter
+Forensic File Converter
 =======================
 A professional-grade Python tool for converting between archive/compression
-formats and disk image formats.
+formats, disk image formats, and forensic image formats.
+
+Author: Cysec Don | cysecdon@gmail.com
 
 Architecture:
     - core/: Detection, dispatch, and conversion matrix
@@ -13,10 +15,12 @@ Usage:
     python -m converter -i input.img -o output.qcow2
     python -m converter --extract archive.zip
     python -m converter --create archive.tar.gz folder/
+    python -m converter -i mem.lime -o mem.raw
 """
 
 __version__ = "1.0.0"
-__author__ = "Universal Converter Team"
+__author__ = "Cysec Don"
+__email__ = "cysecdon@gmail.com"
 
 import os
 import sys

@@ -1,6 +1,8 @@
 """
-Comprehensive test suite for the Universal File Converter.
+Comprehensive test suite for the Forensic File Converter.
 ===========================================================
+
+Author: Cysec Don | cysecdon@gmail.com
 
 Run with::
 
@@ -15,6 +17,7 @@ Tests cover:
 - Validation (overwrite, path traversal, disk space)
 - Archive handler (extract, create, convert, list)
 - Disk image handler (convert, extract)
+- Forensic format handler (LiME, Windows Dump, EWF/E01, AFF)
 - Dispatcher (routing, conversion matrix)
 - CLI (argument parsing, exit codes)
 - Plugin system (registration, lookup)
