@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forensic-file-converter"
+version = "1.0.0"
+description = "A professional-grade Python tool for converting between archive, disk image, and forensic file formats"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Cysec Don", email = "cysecdon@gmail.com"},
+]
+keywords = ["forensic", "converter", "disk-image", "archive", "e01", "lime", "aff", "ewf", "qcow2", "vmdk"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
+    "Intended Audience :: Information Technology",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Security",
+    "Topic :: System :: Archiving",
+    "Topic :: System :: Filesystems",
+    "Topic :: Utilities",
+]
+
+[project.scripts]
+converter = "converter.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["converter*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true

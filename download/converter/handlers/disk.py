@@ -318,14 +318,11 @@ class DiskImageHandler:
         src_qemu = _QEMU_FORMATS[src_fmt]
         tgt_qemu = _QEMU_FORMATS[tgt_fmt]
 
-        # Determine output format string
-        out_fmt_flag = f"-O {tgt_qemu}"
-
         _run_external(
             [
                 "qemu-img", "convert",
                 "-f", src_qemu,
-                out_fmt_flag.split()[0], out_fmt_flag.split()[1],
+                "-O", tgt_qemu,
                 input_path,
                 output_path,
             ],

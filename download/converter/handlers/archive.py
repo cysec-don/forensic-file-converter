@@ -57,7 +57,7 @@ from ..core.dispatcher import ConversionEntry
 from ..core.dependencies import ensure_tool
 from ..utils.validation import (
     require_file_exists, require_dir_exists,
-    check_overwrite, safe_output_path, is_readable, is_writable_dir,
+    check_overwrite, safe_output_path, is_readable,
 )
 
 if TYPE_CHECKING:
@@ -201,7 +201,7 @@ class ArchiveHandler:
                     raise ValueError(
                         f"Path traversal detected in tar archive: {m.name}"
                     )
-            tf.extractall(dest, members=members)
+            tf.extractall(dest, members=members, filter="data")
 
     def _extract_zip(self, path: str, dest: str) -> None:
         with zipfile.ZipFile(path, "r") as zf:
@@ -550,33 +550,29 @@ class ArchiveHandler:
             result = _run_external(
                 ["unrar", "lt", path], description="unrar list"
             )
+            # Parse unrar output (simplified)
+            entries = []
+            for line in result.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 4 and parts[-1] not in ("", "-----------"):
+                    try:
+                        size = int(parts[2])
+                        name = parts[-1]
+                        entries.append({
+                            "name": name,
+                            "size": size,
+                            "is_dir": name.endswith("/"),
+                            "date_time": f"{parts[0]} {parts[1]}",
+                        })
+                    except (ValueError, IndexError):
+                        continue
+            return entries
         elif shutil.which("7z"):
-            result = _run_external(
-                ["7z", "l", "-slt", path], description="7z list (rar)"
-            )
-            # Re-use 7z parsing
+            # Re-use 7z listing (which runs its own 7z command)
             return self._list_7z(path)
         else:
             ensure_tool("unrar", fmt="rar")
             return []  # unreachable
-
-        # Parse unrar output (simplified)
-        entries = []
-        for line in result.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 4 and parts[-1] not in ("", "-----------"):
-                try:
-                    size = int(parts[2])
-                    name = parts[-1]
-                    entries.append({
-                        "name": name,
-                        "size": size,
-                        "is_dir": name.endswith("/"),
-                        "date_time": f"{parts[0]} {parts[1]}",
-                    })
-                except (ValueError, IndexError):
-                    continue
-        return entries
 
     def _list_cab(self, path: str) -> List[dict]:
         # Try 7z listing for CAB

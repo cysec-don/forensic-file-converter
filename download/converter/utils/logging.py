@@ -122,5 +122,9 @@ def configure_logging(verbosity: int = 0) -> logging.Logger:
         handler.setFormatter(ConsoleFormatter())
         handler.addFilter(ErrorFilter())
         root.addHandler(handler)
+    else:
+        # Update the existing handler's level on re-configure
+        for h in root.handlers:
+            h.setLevel(level)
 
     return root
