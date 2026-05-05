@@ -22,26 +22,28 @@ Format coverage
 | .bin    | copy ✓       | mount ✓  | —        | —                   |
 | .iso    | xorriso ✓    | 7z/iso✓  | geniso.. | genisoimage/xorriso |
 | .dmg    | dmg2img ✓    | limited  | macOS only| dmg2img (Linux)     |
+| .dump   | header ✓     | N/A      | N/A      | —                   |
+| .lime   | header ✓     | N/A      | N/A      | —                   |
+
+Forensic formats (.dump, .lime)
+-------------------------------
+- **Windows crash dumps** (.dump / .dmp) start with ``PAGE`` or ``PAGEDU``
+  and contain a DUMP_HEADER followed by physical memory runs.  Converting
+  DUMP → RAW strips the header; RAW → DUMP prepends a minimal header.
+- **LiME** (.lime) has a 24-byte header (magic, version, base address)
+  followed by raw physical memory.  Converting LIME → RAW strips the
+  header; RAW → LIME prepends a new header.
+- These are **partial** conversions: header metadata is lost or fabricated.
+  The raw memory data itself is preserved losslessly.
 
 Design decisions
 ----------------
-- **qemu-img** is the primary tool for virtual-machine disk images.  It
-  supports: qcow2, vmdk, vhd, vhdx, raw, and many more.  We delegate
-  entirely to it rather than reimplementing format-specific headers.
-- **ISO creation** uses ``genisoimage`` (Linux) or ``xorriso`` (portable)
-  because Python has no stdlib ISO 9660 writer.
-- **ISO extraction** uses ``7z`` where available (it understands ISO 9660),
-  falling back to ``bsdtar`` or ``xorriso``.
-- **DMG support is deliberately limited**:
-  - On macOS, ``hdiutil`` can attach/extract DMGs natively.
-  - On Linux, only **raw (unencrypted, non-SPUD)** DMGs can be converted
-    to IMG via ``dmg2img``.  Encrypted DMGs and SPUD (chunked) DMGs are
-    explicitly NOT supported because no open-source tool handles them.
-  - We do NOT attempt to mount DMGs on Linux because it requires FUSE
-    modules that are distribution-specific and fragile.
-- **Raw copies** (.img, .raw, .dd, .bin) are byte-for-byte when the
-  source and target are both raw formats.  No conversion needed — just
-  a copy with optional size validation.
+- **qemu-img** is the primary tool for virtual-machine disk images.
+- **ISO creation** uses ``genisoimage`` / ``xorriso``.
+- **DMG support is deliberately limited** (raw/unencrypted only on Linux).
+- **Raw copies** (.img, .raw, .dd, .bin) are byte-for-byte.
+- **Forensic conversions** stream data in 64 MB chunks to handle large
+  memory dumps (10+ GB) without excessive memory usage.
 - Large files are handled via ``subprocess`` streaming — we never load
   an entire disk image into memory.
 """
@@ -51,12 +53,15 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import struct
 import subprocess
 import tempfile
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 from ..core.detector import (
-    FormatID, FormatInfo, FormatCategory,
+    FormatID, FormatInfo, FormatCategory, detect_format,
+    parse_lime_header, build_lime_header, LIME_HEADER_SIZE_V1,
+    parse_dump_header, WIN_DUMP_HEADER_SIZE,
 )
 from ..core.dispatcher import ConversionEntry
 from ..core.dependencies import ensure_tool
@@ -85,6 +90,12 @@ _QEMU_FORMATS = {
 }
 
 _RAW_FORMATS = {FormatID.RAW, FormatID.DD, FormatID.IMG, FormatID.BIN}
+
+# Forensic / memory-dump formats — have headers that must be managed
+_FORENSIC_FORMATS = {FormatID.DUMP, FormatID.LIME}
+
+# Streaming chunk size for large file operations (64 MiB)
+_STREAM_CHUNK = 64 * 1024 * 1024
 
 
 def _run_external(
@@ -205,6 +216,29 @@ class DiskImageHandler:
         if src_fmt == FormatID.BIN and tgt_fmt in _RAW_FORMATS:
             return self._raw_copy(input_path, output_path, src_fmt, tgt_fmt)
 
+        # --- Forensic format conversions -----------------------------------
+        # LIME ↔ RAW/DD/IMG/BIN
+        if src_fmt == FormatID.LIME and tgt_fmt in _RAW_FORMATS | {FormatID.BIN}:
+            return self._lime_to_raw(input_path, output_path)
+        if src_fmt in _RAW_FORMATS | {FormatID.BIN} and tgt_fmt == FormatID.LIME:
+            return self._raw_to_lime(input_path, output_path)
+
+        # DUMP ↔ RAW/DD/IMG/BIN
+        if src_fmt == FormatID.DUMP and tgt_fmt in _RAW_FORMATS | {FormatID.BIN}:
+            return self._dump_to_raw(input_path, output_path)
+        if src_fmt in _RAW_FORMATS | {FormatID.BIN} and tgt_fmt == FormatID.DUMP:
+            return self._raw_to_dump(input_path, output_path)
+
+        # LIME ↔ DUMP (via raw as intermediate)
+        if src_fmt == FormatID.LIME and tgt_fmt == FormatID.DUMP:
+            return self._lime_to_dump(input_path, output_path)
+        if src_fmt == FormatID.DUMP and tgt_fmt == FormatID.LIME:
+            return self._dump_to_lime(input_path, output_path)
+
+        # Forensic → qemu formats: strip header first, then qemu-img
+        if src_fmt in _FORENSIC_FORMATS and tgt_fmt in _QEMU_FORMATS:
+            return self._forensic_to_qemu(input_path, output_path, src_fmt, tgt_fmt)
+
         raise NotImplementedError(
             f"Disk image conversion from {src_fmt.value} to {tgt_fmt.value} "
             f"is not implemented."
@@ -259,6 +293,254 @@ class DiskImageHandler:
         )
 
         logger.info("qemu-img conversion complete: %s", output_path)
+        return os.path.abspath(output_path)
+
+    # ------------------------------------------------------------------
+    # Forensic format conversions (LIME / DUMP ↔ Raw)
+    # ------------------------------------------------------------------
+
+    def _lime_to_raw(self, input_path: str, output_path: str) -> str:
+        """Strip the 24-byte LiME header and write raw memory data.
+
+        Uses streaming to handle very large memory dumps without loading
+        the entire file into memory.
+        """
+        lime_info = parse_lime_header(input_path)
+        if lime_info is None:
+            raise RuntimeError(
+                f"'{input_path}' does not appear to be a valid LiME file. "
+                f"Expected 'LiME' magic at offset 0."
+            )
+        data_offset = lime_info["data_offset"]
+
+        logger.info(
+            "LIME → RAW: stripping %d-byte LiME v%d header "
+            "(base_address=0x%x) from %s",
+            data_offset, lime_info["version"],
+            lime_info["base_address"], input_path,
+        )
+
+        bytes_skipped = 0
+        with open(input_path, "rb") as f_in, open(output_path, "wb") as f_out:
+            # Skip the LiME header
+            if f_in.seek(data_offset) != data_offset:
+                raise RuntimeError("Failed to seek past LiME header.")
+            bytes_skipped = data_offset
+
+            # Stream the rest
+            while True:
+                chunk = f_in.read(_STREAM_CHUNK)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+
+        in_size = os.path.getsize(input_path)
+        out_size = os.path.getsize(output_path)
+        logger.info(
+            "LIME → RAW complete: skipped %d bytes, "
+            "%d → %d bytes (%.1f MB saved)",
+            bytes_skipped, in_size, out_size,
+            (in_size - out_size) / (1024 * 1024),
+        )
+        return os.path.abspath(output_path)
+
+    def _raw_to_lime(self, input_path: str, output_path: str) -> str:
+        """Prepend a LiME v1 header to raw memory data.
+
+        The base address is set to 0 (the most common default for x86_64).
+        Users who need a specific base address should edit the LiME file
+        with a hex editor or use the LiME tool directly.
+        """
+        header = build_lime_header(version=1, base_address=0)
+
+        logger.info(
+            "RAW → LIME: prepending %d-byte LiME v1 header "
+            "(base_address=0x0) to %s",
+            len(header), input_path,
+        )
+
+        with open(input_path, "rb") as f_in, open(output_path, "wb") as f_out:
+            f_out.write(header)
+            while True:
+                chunk = f_in.read(_STREAM_CHUNK)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+
+        in_size = os.path.getsize(input_path)
+        out_size = os.path.getsize(output_path)
+        logger.info(
+            "RAW → LIME complete: %d → %d bytes (+%d header)",
+            in_size, out_size, len(header),
+        )
+        return os.path.abspath(output_path)
+
+    def _dump_to_raw(self, input_path: str, output_path: str) -> str:
+        """Strip the Windows crash dump header and write raw memory data.
+
+        The DUMP_HEADER is 4096 bytes, followed by a PHYSICAL_MEMORY_RUN
+        array.  We use a conservative approach: skip the first 4096 bytes
+        and stream the rest.  This preserves all memory pages but may
+        include the run descriptor array as part of the raw output.
+
+        For a more precise conversion, use Volatility or WinDbg to extract
+        individual memory runs.
+        """
+        dump_info = parse_dump_header(input_path)
+        if dump_info is None:
+            raise RuntimeError(
+                f"'{input_path}' does not appear to be a valid Windows crash "
+                f"dump.  Expected 'PAGE' or 'PAGEDU' magic at offset 0."
+            )
+
+        header_size = dump_info["header_size"]
+        logger.info(
+            "DUMP → RAW: stripping %d-byte Windows dump header "
+            "(%s, %s) from %s",
+            header_size, dump_info["signature"],
+            dump_info["dump_type"], input_path,
+        )
+
+        with open(input_path, "rb") as f_in, open(output_path, "wb") as f_out:
+            f_in.seek(header_size)
+            while True:
+                chunk = f_in.read(_STREAM_CHUNK)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+
+        in_size = os.path.getsize(input_path)
+        out_size = os.path.getsize(output_path)
+        logger.info(
+            "DUMP → RAW complete: skipped %d bytes, "
+            "%d → %d bytes (%.1f MB saved)",
+            header_size, in_size, out_size,
+            (in_size - out_size) / (1024 * 1024),
+        )
+        return os.path.abspath(output_path)
+
+    def _raw_to_dump(self, input_path: str, output_path: str) -> str:
+        """Prepend a minimal Windows crash dump header to raw data.
+
+        .. warning::
+            The fabricated header will NOT contain valid system context
+            (system time, bugcheck parameters, etc.).  It is suitable for
+            tools that accept raw memory analysis but NOT for use with
+            WinDbg or crash dump debugging.
+
+        The header signature is ``PAGE`` (32-bit) by default.
+        """
+        # Build a minimal DUMP_HEADER (4096 bytes)
+        header = bytearray(WIN_DUMP_HEADER_SIZE)
+        header[0:4] = b"PAGE"
+        # ValidDump = 2 (FullDump) at offset 8
+        struct.pack_into("<I", header, 8, 2)
+
+        logger.warning(
+            "RAW → DUMP: prepending a MINIMAL Windows dump header to %s. "
+            "The header will not contain valid system context. "
+            "Use only for tools that accept raw memory, NOT for WinDbg.",
+            input_path,
+        )
+
+        with open(input_path, "rb") as f_in, open(output_path, "wb") as f_out:
+            f_out.write(bytes(header))
+            while True:
+                chunk = f_in.read(_STREAM_CHUNK)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+
+        in_size = os.path.getsize(input_path)
+        out_size = os.path.getsize(output_path)
+        logger.info(
+            "RAW → DUMP complete: %d → %d bytes (+%d header)",
+            in_size, out_size, len(header),
+        )
+        return os.path.abspath(output_path)
+
+    def _lime_to_dump(self, input_path: str, output_path: str) -> str:
+        """Convert LiME → Windows dump format.
+
+        Two-step: strip LiME header → prepend Windows dump header.
+        Uses a temp file as intermediate to avoid loading into memory.
+        """
+        with tempfile.NamedTemporaryFile(
+            delete=False, prefix="lime_dump_tmp_", suffix=".raw",
+        ) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            self._lime_to_raw(input_path, tmp_path)
+            self._raw_to_dump(tmp_path, output_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        return os.path.abspath(output_path)
+
+    def _dump_to_lime(self, input_path: str, output_path: str) -> str:
+        """Convert Windows dump → LiME format.
+
+        Two-step: strip dump header → prepend LiME header.
+        Uses a temp file as intermediate.
+        """
+        with tempfile.NamedTemporaryFile(
+            delete=False, prefix="dump_lime_tmp_", suffix=".raw",
+        ) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            self._dump_to_raw(input_path, tmp_path)
+            self._raw_to_lime(tmp_path, output_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        return os.path.abspath(output_path)
+
+    def _forensic_to_qemu(
+        self,
+        input_path: str,
+        output_path: str,
+        src_fmt: FormatID,
+        tgt_fmt: FormatID,
+    ) -> str:
+        """Convert a forensic format to a VM disk image.
+
+        Two-step: strip header to raw → qemu-img convert.
+        """
+        with tempfile.NamedTemporaryFile(
+            delete=False, prefix=f"forensic_{src_fmt.value}_",
+            suffix=".raw",
+        ) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            # Step 1: strip to raw
+            if src_fmt == FormatID.LIME:
+                self._lime_to_raw(input_path, tmp_path)
+            elif src_fmt == FormatID.DUMP:
+                self._dump_to_raw(input_path, tmp_path)
+            else:
+                shutil.copy2(input_path, tmp_path)
+
+            # Step 2: qemu-img raw → target
+            ensure_tool("qemu-img", fmt=tgt_fmt.value)
+            tgt_qemu = _QEMU_FORMATS[tgt_fmt]
+            _run_external(
+                [
+                    "qemu-img", "convert",
+                    "-f", "raw", "-O", tgt_qemu,
+                    tmp_path, output_path,
+                ],
+                description=f"qemu-img convert (raw → {tgt_qemu})",
+            )
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        logger.info("Forensic → qemu complete: %s", output_path)
         return os.path.abspath(output_path)
 
     # ------------------------------------------------------------------

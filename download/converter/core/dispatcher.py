@@ -114,6 +114,10 @@ def _build_conversion_matrix() -> Dict[Tuple[FormatID, FormatID], ConversionEntr
     qemu_formats = [FormatID.QCOW2, FormatID.VMDK, FormatID.VHD, FormatID.VHDX]
     raw_formats  = [FormatID.RAW, FormatID.DD, FormatID.IMG]
 
+    # Forensic / memory-dump formats — these have headers that must be
+    # stripped (→ raw) or inserted (← raw) during conversion.
+    forensic_formats = [FormatID.DUMP, FormatID.LIME]
+
     for src in qemu_formats:
         for tgt in qemu_formats:
             if src != tgt:
@@ -156,6 +160,58 @@ def _build_conversion_matrix() -> Dict[Tuple[FormatID, FormatID], ConversionEntr
     _add(FormatID.DMG, FormatID.RAW, ConversionSupport.EXTERNAL,
          "DMG → RAW via dmg2img. Same caveats as DMG → IMG.",
          requires_tool="dmg2img")
+
+    # -- Forensic ↔ Forensic & Forensic ↔ Raw ------------------------------
+
+    # DUMP ↔ LIME: convert via raw as intermediate (header strip + insert)
+    _add(FormatID.DUMP, FormatID.LIME, ConversionSupport.PARTIAL,
+         "DUMP → LIME: strip Windows dump header, wrap in LiME header. "
+         "The Windows dump header metadata is lost; only the raw memory "
+         "pages are preserved.")
+    _add(FormatID.LIME, FormatID.DUMP, ConversionSupport.PARTIAL,
+         "LIME → DUMP: strip LiME header, wrap in Windows dump header. "
+         "The LiME metadata (base address) is preserved in the output "
+         "but the Windows dump context (system info) cannot be reconstructed.")
+
+    # DUMP ↔ Raw
+    for raw_fmt in raw_formats:
+        _add(FormatID.DUMP, raw_fmt, ConversionSupport.PARTIAL,
+             "DUMP → raw: strip the Windows crash dump header. "
+             "Header metadata (system info, dump type) is lost.")
+        _add(raw_fmt, FormatID.DUMP, ConversionSupport.PARTIAL,
+             "Raw → DUMP: prepend a minimal Windows dump header. "
+             "The header will not contain valid system context — "
+             "suitable for analysis tools that accept raw memory "
+             "but not for Windows debugging.")
+
+    # LIME ↔ Raw
+    for raw_fmt in raw_formats:
+        _add(FormatID.LIME, raw_fmt, ConversionSupport.PARTIAL,
+             "LIME → raw: strip the 24-byte LiME header. "
+             "Base address metadata is lost.")
+        _add(raw_fmt, FormatID.LIME, ConversionSupport.PARTIAL,
+             "Raw → LIME: prepend a LiME v1 header with base address 0. "
+             "Use with caution — the base address should match the "
+             "source system for accurate analysis.")
+
+    # Forensic ↔ BIN
+    _add(FormatID.DUMP, FormatID.BIN, ConversionSupport.PARTIAL,
+         "DUMP → BIN: strip dump header, output raw binary.")
+    _add(FormatID.BIN, FormatID.DUMP, ConversionSupport.PARTIAL,
+         "BIN → DUMP: prepend minimal dump header.")
+    _add(FormatID.LIME, FormatID.BIN, ConversionSupport.PARTIAL,
+         "LIME → BIN: strip LiME header, output raw binary.")
+    _add(FormatID.BIN, FormatID.LIME, ConversionSupport.PARTIAL,
+         "BIN → LIME: prepend LiME v1 header with base address 0.")
+
+    # Forensic ↔ qemu (via raw)
+    for fmt in forensic_formats:
+        for q_fmt in qemu_formats:
+            _add(fmt, q_fmt, ConversionSupport.EXTERNAL,
+                 f"Forensic ({fmt.value}) → VM format via qemu-img. "
+                 f"Header is stripped first; raw memory is wrapped as a "
+                 f"raw disk image.",
+                 requires_tool="qemu-img")
 
     return matrix
 

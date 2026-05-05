@@ -73,6 +73,10 @@ class FormatID(enum.Enum):
     QCOW2 = "qcow2"
     DMG = "dmg"
 
+    # -- forensic / memory dump ------------------------------------------
+    DUMP = "dump"
+    LIME = "lime"
+
 
 # ---------------------------------------------------------------------------
 # Magic-byte signatures
@@ -103,6 +107,13 @@ _MAGIC_SIGNATURES: List[Tuple[int, bytes, FormatID]] = [
     # offset.
     # DMG – starts with a zero-filled 512-byte header; hard to detect
     # unambiguously via magic bytes alone.  We rely on extension for DMG.
+    # Forensic / memory dump formats
+    # Windows crash dump (64-bit): "PAGEDU" at offset 0 — check BEFORE PAGE
+    (0, b"PAGEDU",            FormatID.DUMP),
+    # Windows crash dump (32-bit): "PAGE" at offset 0
+    (0, b"PAGE",              FormatID.DUMP),
+    # LiME (Linux Memory Extractor): "LiME" at offset 0
+    (0, b"LiME",              FormatID.LIME),
 ]
 
 # How many trailing bytes to read for formats with footer magic
@@ -142,6 +153,11 @@ _EXTENSION_MAP: Dict[str, FormatID] = {
     ".vmdk":   FormatID.VMDK,
     ".qcow2":  FormatID.QCOW2,
     ".dmg":    FormatID.DMG,
+    # forensic / memory dump
+    ".dump":   FormatID.DUMP,
+    ".dmp":    FormatID.DUMP,   # Windows crash dump alias
+    ".vdmp":   FormatID.DUMP,   # VMware dump alias
+    ".lime":   FormatID.LIME,
 }
 
 # Format -> category
@@ -167,6 +183,8 @@ _FORMAT_CATEGORY: Dict[FormatID, FormatCategory] = {
     FormatID.VMDK:     FormatCategory.DISK_IMAGE,
     FormatID.QCOW2:    FormatCategory.DISK_IMAGE,
     FormatID.DMG:      FormatCategory.DISK_IMAGE,
+    FormatID.DUMP:     FormatCategory.DISK_IMAGE,
+    FormatID.LIME:     FormatCategory.DISK_IMAGE,
 }
 
 # Canonical output extensions (for generating default output names)
@@ -192,6 +210,8 @@ _FORMAT_EXT: Dict[FormatID, str] = {
     FormatID.VMDK:     ".vmdk",
     FormatID.QCOW2:    ".qcow2",
     FormatID.DMG:      ".dmg",
+    FormatID.DUMP:     ".dump",
+    FormatID.LIME:     ".lime",
 }
 
 
@@ -390,3 +410,155 @@ def all_archive_formats() -> List[FormatID]:
 
 def all_disk_formats() -> List[FormatID]:
     return [f for f, c in _FORMAT_CATEGORY.items() if c == FormatCategory.DISK_IMAGE]
+
+
+# ---------------------------------------------------------------------------
+# LiME header constants and parsing
+# ---------------------------------------------------------------------------
+# LiME (Linux Memory Extractor) is a forensic tool that captures physical
+# memory from a running Linux system.  The output file has a small header
+# followed by the raw memory pages.
+#
+# LiME v1 header layout (24 bytes total):
+#   Offset  Size  Field
+#   0       4     Magic (b"LiME")
+#   4       1     Version (typically 1)
+#   5       3     Reserved (zero padding)
+#   8       8     Base address (uint64 LE) — start of physical memory
+#   16      8     Reserved (zero padding)
+#
+# The actual memory data begins at byte 24.
+# Reference: https://github.com/504ensicsLab/LiME
+
+LIME_MAGIC = b"LiME"
+LIME_HEADER_SIZE_V1 = 24
+LIME_VERSION_OFFSET = 4
+
+
+def parse_lime_header(path: str) -> Optional[dict]:
+    """Parse a LiME file header and return metadata.
+
+    Returns ``None`` if the file is not a valid LiME image.
+
+    Parameters
+    ----------
+    path : str
+        Path to the LiME file.
+
+    Returns
+    -------
+    dict | None
+        ``{"version": int, "base_address": int, "header_size": int,
+        "data_offset": int}``
+    """
+    try:
+        with open(path, "rb") as fh:
+            header = fh.read(LIME_HEADER_SIZE_V1 + 1)
+    except OSError:
+        return None
+
+    if len(header) < LIME_HEADER_SIZE_V1:
+        return None
+    if header[:4] != LIME_MAGIC:
+        return None
+
+    version = header[LIME_VERSION_OFFSET]
+    base_address = struct.unpack_from("<Q", header, 8)[0]
+
+    return {
+        "version": version,
+        "base_address": base_address,
+        "header_size": LIME_HEADER_SIZE_V1,
+        "data_offset": LIME_HEADER_SIZE_V1,
+    }
+
+
+def build_lime_header(version: int = 1, base_address: int = 0) -> bytes:
+    """Build a 24-byte LiME v1 header.
+
+    Parameters
+    ----------
+    version : int
+        LiME format version (typically 1).
+    base_address : int
+        Physical memory base address (little-endian uint64).
+
+    Returns
+    -------
+    bytes  — exactly ``LIME_HEADER_SIZE_V1`` bytes.
+    """
+    header = bytearray(LIME_HEADER_SIZE_V1)
+    header[0:4] = LIME_MAGIC
+    header[LIME_VERSION_OFFSET] = version & 0xFF
+    struct.pack_into("<Q", header, 8, base_address)
+    return bytes(header)
+
+
+# ---------------------------------------------------------------------------
+# Windows crash dump header constants and parsing
+# ---------------------------------------------------------------------------
+# Windows crash dumps have several sub-types.  All share a signature at
+# offset 0:
+#   b"PAGE"   — 32-bit complete / kernel dump
+#   b"PAGEDU" — 64-bit complete / kernel dump
+#
+# The DUMP_HEADER structure at offset 0 contains a ``ValidDump`` field
+# (uint32 at offset 8) that identifies the dump type:
+#   1 = MiniDump (user-mode)
+#   2 = FullDump (complete physical memory)
+#   3 = KernelDump
+#
+# The DUMP_HEADER is followed by a PHYSICAL_MEMORY_RUN array that
+# describes the memory pages.  For our DUMP → RAW conversion we use a
+# conservative approach: skip the fixed-size header region (4096 bytes)
+# and stream the rest as raw memory data.
+#
+# Reference: Microsoft Debug Help Library / crash dump specification.
+
+WIN_DUMP_SIGNATURE_32 = b"PAGE"
+WIN_DUMP_SIGNATURE_64 = b"PAGEDU"
+WIN_DUMP_HEADER_SIZE = 4096
+
+
+def parse_dump_header(path: str) -> Optional[dict]:
+    """Parse a Windows crash dump header.
+
+    Returns ``None`` if the file is not a recognized Windows dump.
+
+    Parameters
+    ----------
+    path : str
+        Path to the dump file.
+
+    Returns
+    -------
+    dict | None
+        ``{"signature": str, "dump_type": str, "valid_dump": int,
+        "header_size": int}``
+    """
+    try:
+        with open(path, "rb") as fh:
+            header = fh.read(64)
+    except OSError:
+        return None
+
+    if len(header) < 8:
+        return None
+
+    if header[:6] == WIN_DUMP_SIGNATURE_64:
+        sig = "PAGEDU"
+    elif header[:4] == WIN_DUMP_SIGNATURE_32:
+        sig = "PAGE"
+    else:
+        return None
+
+    valid_dump = struct.unpack_from("<I", header, 8)[0] if len(header) >= 12 else 0
+    dump_types = {1: "MiniDump", 2: "FullDump", 3: "KernelDump"}
+    dump_type = dump_types.get(valid_dump, f"Unknown (ValidDump={valid_dump})")
+
+    return {
+        "signature": sig,
+        "dump_type": dump_type,
+        "valid_dump": valid_dump,
+        "header_size": WIN_DUMP_HEADER_SIZE,
+    }

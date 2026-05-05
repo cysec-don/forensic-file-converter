@@ -131,6 +131,12 @@ def check_all() -> DependencyReport:
             "Install dmg2img:  sudo apt install dmg2img",
             ["dmg"],
         ),
+        (
+            "lime",
+            "Install LiME:  https://github.com/504ensicsLab/LiME  "
+            "(compile from source — no package manager install)",
+            ["lime"],
+        ),
     ]
 
     for name, hint, formats in definitions:

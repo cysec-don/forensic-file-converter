@@ -47,6 +47,8 @@ from converter.core.detector import (
     get_category, get_extension,
     _normalise_ext, all_archive_formats, all_disk_formats,
     _MAGIC_SIGNATURES,
+    parse_lime_header, build_lime_header, LIME_HEADER_SIZE_V1,
+    parse_dump_header, WIN_DUMP_HEADER_SIZE,
 )
 from converter.core.dispatcher import (
     Dispatcher, ConversionSupport, UnsupportedConversion,
@@ -571,6 +573,340 @@ class TestDispatcher(_TempDirTestCase):
         self.assertIn("file1.txt", names)
         self.assertIn("file2.txt", names)
 
+    # --- Forensic conversions --------------------------------------------
+
+    def test_forensic_dump_to_raw_supported(self):
+        entry = get_conversion_entry(FormatID.DUMP, FormatID.RAW)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_forensic_lime_to_raw_supported(self):
+        entry = get_conversion_entry(FormatID.LIME, FormatID.RAW)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_forensic_raw_to_lime_supported(self):
+        entry = get_conversion_entry(FormatID.RAW, FormatID.LIME)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_forensic_raw_to_dump_supported(self):
+        entry = get_conversion_entry(FormatID.RAW, FormatID.DUMP)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_forensic_lime_to_dump_supported(self):
+        entry = get_conversion_entry(FormatID.LIME, FormatID.DUMP)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_forensic_dump_to_lime_supported(self):
+        entry = get_conversion_entry(FormatID.DUMP, FormatID.LIME)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_forensic_dump_to_qcow2_supported(self):
+        entry = get_conversion_entry(FormatID.DUMP, FormatID.QCOW2)
+        self.assertEqual(entry.support, ConversionSupport.EXTERNAL)
+
+
+# ============================================================================
+# LiME Header Parsing Tests
+# ============================================================================
+
+class TestLimeHeader(_TempDirTestCase):
+
+    def test_build_lime_header_size(self):
+        header = build_lime_header()
+        self.assertEqual(len(header), LIME_HEADER_SIZE_V1)
+
+    def test_build_lime_header_magic(self):
+        header = build_lime_header(version=1, base_address=0x1000)
+        self.assertEqual(header[:4], b"LiME")
+
+    def test_build_lime_header_version(self):
+        header = build_lime_header(version=3)
+        self.assertEqual(header[4], 3)
+
+    def test_build_lime_header_base_address(self):
+        header = build_lime_header(version=1, base_address=0x100000)
+        addr = struct.unpack_from("<Q", header, 8)[0]
+        self.assertEqual(addr, 0x100000)
+
+    def test_parse_lime_header_valid(self):
+        original_header = build_lime_header(version=2, base_address=0x200000)
+        payload = b"\xDE\xAD" * 100
+        path = self.write_file("mem.lime", original_header + payload)
+        info = parse_lime_header(path)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["version"], 2)
+        self.assertEqual(info["base_address"], 0x200000)
+        self.assertEqual(info["header_size"], LIME_HEADER_SIZE_V1)
+        self.assertEqual(info["data_offset"], LIME_HEADER_SIZE_V1)
+
+    def test_parse_lime_header_too_short(self):
+        path = self.write_file("short.lime", b"LiME\x01")  # only 5 bytes
+        info = parse_lime_header(path)
+        self.assertIsNone(info)
+
+    def test_parse_lime_header_wrong_magic(self):
+        path = self.write_file("notlime.dat", b"\x00" * 50)
+        info = parse_lime_header(path)
+        self.assertIsNone(info)
+
+    def test_parse_lime_header_nonexistent(self):
+        info = parse_lime_header("/nonexistent/file.lime")
+        self.assertIsNone(info)
+
+    def test_lime_roundtrip_build_parse(self):
+        header = build_lime_header(version=1, base_address=0xFFFF0000)
+        path = self.write_file("rt.lime", header + b"\x00" * 100)
+        parsed = parse_lime_header(path)
+        self.assertEqual(parsed["version"], 1)
+        self.assertEqual(parsed["base_address"], 0xFFFF0000)
+
+
+# ============================================================================
+# Windows Dump Header Parsing Tests
+# ============================================================================
+
+class TestDumpHeader(_TempDirTestCase):
+
+    def test_build_page_header(self):
+        buf = bytearray(64)
+        buf[0:4] = b"PAGE"
+        struct.pack_into("<I", buf, 8, 2)
+        path = self.write_file("crash.dump", bytes(buf))
+        info = parse_dump_header(path)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["signature"], "PAGE")
+        self.assertEqual(info["dump_type"], "FullDump")
+        self.assertEqual(info["valid_dump"], 2)
+        self.assertEqual(info["header_size"], WIN_DUMP_HEADER_SIZE)
+
+    def test_build_pagedu_header(self):
+        buf = bytearray(64)
+        buf[0:6] = b"PAGEDU"
+        struct.pack_into("<I", buf, 8, 3)
+        path = self.write_file("crash.dump", bytes(buf))
+        info = parse_dump_header(path)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["signature"], "PAGEDU")
+        self.assertEqual(info["dump_type"], "KernelDump")
+
+    def test_parse_minidump_type(self):
+        buf = bytearray(64)
+        buf[0:4] = b"PAGE"
+        struct.pack_into("<I", buf, 8, 1)
+        path = self.write_file("mini.dmp", bytes(buf))
+        info = parse_dump_header(path)
+        self.assertEqual(info["dump_type"], "MiniDump")
+
+    def test_parse_unknown_dump_type(self):
+        buf = bytearray(64)
+        buf[0:4] = b"PAGE"
+        struct.pack_into("<I", buf, 8, 99)
+        path = self.write_file("unknown.dump", bytes(buf))
+        info = parse_dump_header(path)
+        self.assertIn("Unknown", info["dump_type"])
+
+    def test_parse_not_a_dump(self):
+        path = self.write_file("notadump.dat", b"\x00" * 50)
+        info = parse_dump_header(path)
+        self.assertIsNone(info)
+
+    def test_parse_too_short(self):
+        path = self.write_file("short.dump", b"PA")
+        info = parse_dump_header(path)
+        self.assertIsNone(info)
+
+    def test_parse_nonexistent(self):
+        info = parse_dump_header("/nonexistent/file.dump")
+        self.assertIsNone(info)
+
+
+# ============================================================================
+# Forensic Handler Conversion Tests
+# ============================================================================
+
+class TestForensicConversions(_TempDirTestCase):
+    """Test actual disk handler conversions for .lime and .dump formats."""
+
+    def setUp(self):
+        super().setUp()
+        self.dispatcher = Dispatcher()
+        self.handler = DiskImageHandler(dispatcher=self.dispatcher)
+
+    # -- Payload for testing --
+    def _make_lime_file(self, name="mem.lime", payload_size=4096,
+                        version=1, base_address=0):
+        header = build_lime_header(version=version, base_address=base_address)
+        payload = os.urandom(payload_size)
+        return self.write_file(name, header + payload), payload
+
+    def _make_dump_file(self, name="crash.dump", payload_size=4096):
+        header = bytearray(WIN_DUMP_HEADER_SIZE)
+        header[0:4] = b"PAGE"
+        struct.pack_into("<I", header, 8, 2)  # FullDump
+        payload = os.urandom(payload_size)
+        return self.write_file(name, bytes(header) + payload), payload
+
+    # -- LiME → RAW -------------------------------------------------------
+
+    def test_lime_to_raw_strips_header(self):
+        lime_path, payload = self._make_lime_file(payload_size=8192)
+        out = self.tmpfile("mem.raw")
+        result = self.handler.convert(
+            lime_path, out, target_fmt=FormatID.RAW, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        # Output should be exactly the payload (no header)
+        self.assertEqual(os.path.getsize(result), 8192)
+        with open(result, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_lime_to_dd(self):
+        lime_path, payload = self._make_lime_file(payload_size=1024)
+        out = self.tmpfile("mem.dd")
+        result = self.handler.convert(
+            lime_path, out, target_fmt=FormatID.DD, overwrite=True,
+        )
+        self.assertEqual(os.path.getsize(result), 1024)
+
+    def test_lime_to_img(self):
+        lime_path, payload = self._make_lime_file(payload_size=1024)
+        out = self.tmpfile("mem.img")
+        result = self.handler.convert(
+            lime_path, out, target_fmt=FormatID.IMG, overwrite=True,
+        )
+        self.assertEqual(os.path.getsize(result), 1024)
+
+    # -- RAW → LiME -------------------------------------------------------
+
+    def test_raw_to_lime_prepends_header(self):
+        raw_path = self.write_file("mem.raw", os.urandom(4096))
+        out = self.tmpfile("mem.lime")
+        result = self.handler.convert(
+            raw_path, out, target_fmt=FormatID.LIME, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        # Output should be header (24 bytes) + payload
+        self.assertEqual(os.path.getsize(result), 4096 + LIME_HEADER_SIZE_V1)
+        with open(result, "rb") as f:
+            magic = f.read(4)
+            self.assertEqual(magic, b"LiME")
+
+    # -- DUMP → RAW -------------------------------------------------------
+
+    def test_dump_to_raw_strips_header(self):
+        dump_path, payload = self._make_dump_file(payload_size=8192)
+        out = self.tmpfile("mem.raw")
+        result = self.handler.convert(
+            dump_path, out, target_fmt=FormatID.RAW, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        # Output should be payload (dump header stripped)
+        self.assertEqual(os.path.getsize(result), 8192)
+        with open(result, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_dump_to_dd(self):
+        dump_path, payload = self._make_dump_file(payload_size=1024)
+        out = self.tmpfile("mem.dd")
+        result = self.handler.convert(
+            dump_path, out, target_fmt=FormatID.DD, overwrite=True,
+        )
+        self.assertEqual(os.path.getsize(result), 1024)
+
+    # -- RAW → DUMP -------------------------------------------------------
+
+    def test_raw_to_dump_prepends_header(self):
+        raw_path = self.write_file("mem.raw", os.urandom(4096))
+        out = self.tmpfile("mem.dump")
+        result = self.handler.convert(
+            raw_path, out, target_fmt=FormatID.DUMP, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        # Output should be WIN_DUMP_HEADER_SIZE + payload
+        self.assertEqual(os.path.getsize(result), 4096 + WIN_DUMP_HEADER_SIZE)
+        with open(result, "rb") as f:
+            magic = f.read(4)
+            self.assertEqual(magic, b"PAGE")
+
+    # -- LIME ↔ DUMP cross-conversion -------------------------------------
+
+    def test_lime_to_dump(self):
+        lime_path, payload = self._make_lime_file(payload_size=2048)
+        out = self.tmpfile("converted.dump")
+        result = self.handler.convert(
+            lime_path, out, target_fmt=FormatID.DUMP, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        # Should have PAGE magic
+        with open(result, "rb") as f:
+            self.assertEqual(f.read(4), b"PAGE")
+
+    def test_dump_to_lime(self):
+        dump_path, payload = self._make_dump_file(payload_size=2048)
+        out = self.tmpfile("converted.lime")
+        result = self.handler.convert(
+            dump_path, out, target_fmt=FormatID.LIME, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        # Should have LiME magic
+        with open(result, "rb") as f:
+            self.assertEqual(f.read(4), b"LiME")
+
+    # -- LiME ↔ BIN -------------------------------------------------------
+
+    def test_lime_to_bin(self):
+        lime_path, payload = self._make_lime_file(payload_size=1024)
+        out = self.tmpfile("mem.bin")
+        result = self.handler.convert(
+            lime_path, out, target_fmt=FormatID.BIN, overwrite=True,
+        )
+        self.assertEqual(os.path.getsize(result), 1024)
+
+    def test_bin_to_lime(self):
+        bin_path = self.write_file("mem.bin", os.urandom(1024))
+        out = self.tmpfile("mem.lime")
+        result = self.handler.convert(
+            bin_path, out, target_fmt=FormatID.LIME, overwrite=True,
+        )
+        self.assertEqual(os.path.getsize(result), 1024 + LIME_HEADER_SIZE_V1)
+
+    # -- Error cases ------------------------------------------------------
+
+    def test_lime_to_raw_invalid_lime_file(self):
+        """A file without LiME magic should raise when converting to RAW."""
+        bad = self.write_file("notlime.dat", b"\x00" * 100)
+        out = self.tmpfile("out.raw")
+        with self.assertRaises(RuntimeError):
+            self.handler.convert(
+                bad, out, target_fmt=FormatID.RAW, overwrite=True,
+            )
+
+    def test_dump_to_raw_invalid_dump_file(self):
+        """A file without PAGE/PAGEDU magic should raise."""
+        bad = self.write_file("notadump.dat", b"\x00" * 100)
+        out = self.tmpfile("out.raw")
+        with self.assertRaises(RuntimeError):
+            self.handler.convert(
+                bad, out, target_fmt=FormatID.RAW, overwrite=True,
+            )
+
+    # -- Large file streaming test ----------------------------------------
+
+    def test_lime_to_raw_large_payload(self):
+        """Verify streaming works with a payload larger than _STREAM_CHUNK."""
+        payload_size = 128 * 1024 * 1024  # 128 MiB
+        header = build_lime_header(version=1, base_address=0)
+        # Create a LiME file: 24-byte header + payload_size bytes of data
+        lime_path = self.tmpfile("large.lime")
+        with open(lime_path, "wb") as f:
+            f.write(header)
+            f.write(os.urandom(payload_size))
+
+        out = self.tmpfile("large.raw")
+        result = self.handler.convert(
+            lime_path, out, target_fmt=FormatID.RAW, overwrite=True,
+        )
+        self.assertEqual(os.path.getsize(result), payload_size)
+
 
 # ============================================================================
 # Dependency Check Tests
@@ -738,6 +1074,59 @@ class TestEdgeCases(_TempDirTestCase):
         # Should still detect via extension even though file doesn't exist
         self.assertEqual(info.format_id, FormatID.ZIP)
         self.assertEqual(info.detected_by, "extension")
+
+    # --- Forensic format detection ---------------------------------------
+
+    def test_extension_dump(self):
+        path = self.write_file("crash.dump", b"\x00" * 100)
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.DUMP)
+        self.assertEqual(info.detected_by, "extension")
+
+    def test_extension_dmp(self):
+        path = self.write_file("crash.dmp", b"\x00" * 100)
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.DUMP)
+
+    def test_magic_page_dump_32bit(self):
+        buf = bytearray(64)
+        buf[0:4] = b"PAGE"
+        struct.pack_into("<I", buf, 8, 2)  # FullDump
+        path = self.write_file("crash.dat", bytes(buf))
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.DUMP)
+        self.assertEqual(info.detected_by, "magic")
+
+    def test_magic_pagedu_dump_64bit(self):
+        buf = bytearray(64)
+        buf[0:5] = b"PAGEDU"
+        struct.pack_into("<I", buf, 8, 3)  # KernelDump
+        path = self.write_file("crash.dat", bytes(buf))
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.DUMP)
+        self.assertEqual(info.detected_by, "magic")
+
+    def test_extension_lime(self):
+        path = self.write_file("mem.lime", b"\x00" * 100)
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.LIME)
+        self.assertEqual(info.detected_by, "extension")
+
+    def test_magic_lime(self):
+        header = build_lime_header(version=1, base_address=0x1000)
+        path = self.write_file("mem.dat", header + b"\x00" * 100)
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.LIME)
+        self.assertEqual(info.detected_by, "magic")
+
+    def test_lime_category_is_disk_image(self):
+        self.assertEqual(get_category(FormatID.LIME), FormatCategory.DISK_IMAGE)
+        self.assertEqual(get_category(FormatID.DUMP), FormatCategory.DISK_IMAGE)
+
+    def test_lime_extension_in_all_disk(self):
+        df = all_disk_formats()
+        self.assertIn(FormatID.LIME, df)
+        self.assertIn(FormatID.DUMP, df)
 
 
 # ============================================================================
