@@ -62,6 +62,8 @@ from ..core.detector import (
     FormatID, FormatInfo, FormatCategory, detect_format,
     parse_lime_header, build_lime_header, LIME_HEADER_SIZE_V1,
     parse_dump_header, WIN_DUMP_HEADER_SIZE,
+    parse_ewf_header, build_ewf_header, EWF_FULL_HEADER_SIZE,
+    parse_aff_header, build_aff_header, AFF_HEADER_SIZE,
 )
 from ..core.dispatcher import ConversionEntry
 from ..core.dependencies import ensure_tool
@@ -92,7 +94,13 @@ _QEMU_FORMATS = {
 _RAW_FORMATS = {FormatID.RAW, FormatID.DD, FormatID.IMG, FormatID.BIN}
 
 # Forensic / memory-dump formats — have headers that must be managed
-_FORENSIC_FORMATS = {FormatID.DUMP, FormatID.LIME}
+_FORENSIC_FORMATS = {
+    FormatID.DUMP, FormatID.LIME,
+    FormatID.E01, FormatID.EX01, FormatID.AFF,
+}
+
+# EWF (EnCase) formats — Autopsy/Guymager primary format
+_EWF_FORMATS = {FormatID.E01, FormatID.EX01}
 
 # Streaming chunk size for large file operations (64 MiB)
 _STREAM_CHUNK = 64 * 1024 * 1024
@@ -235,8 +243,40 @@ class DiskImageHandler:
         if src_fmt == FormatID.DUMP and tgt_fmt == FormatID.LIME:
             return self._dump_to_lime(input_path, output_path)
 
+        # --- EWF (EnCase) / Autopsy / Guymager format conversions -----------
+        # These must come BEFORE the generic forensic → qemu check
+        # because _QEMU_FORMATS includes RAW/DD/IMG.
+        # E01/EX01 → raw (strip EWF header)
+        if src_fmt in _EWF_FORMATS and tgt_fmt in _RAW_FORMATS | {FormatID.BIN}:
+            return self._ewf_to_raw(input_path, output_path, src_fmt)
+        # raw → E01/EX01 (prepend EWF header)
+        if src_fmt in _RAW_FORMATS | {FormatID.BIN} and tgt_fmt in _EWF_FORMATS:
+            return self._raw_to_ewf(input_path, output_path, tgt_fmt)
+        # E01 ↔ EX01 (re-header)
+        if src_fmt in _EWF_FORMATS and tgt_fmt in _EWF_FORMATS:
+            return self._ewf_reheader(input_path, output_path, src_fmt, tgt_fmt)
+        # E01/EX01 ↔ DUMP/LIME (two-step via raw)
+        if src_fmt in _EWF_FORMATS and tgt_fmt in {FormatID.DUMP, FormatID.LIME}:
+            return self._ewf_to_forensic(input_path, output_path, src_fmt, tgt_fmt)
+        if src_fmt in {FormatID.DUMP, FormatID.LIME} and tgt_fmt in _EWF_FORMATS:
+            return self._forensic_to_ewf(input_path, output_path, src_fmt, tgt_fmt)
+
+        # --- AFF format conversions ----------------------------------------
+        # AFF → raw (strip AFF header)
+        if src_fmt == FormatID.AFF and tgt_fmt in _RAW_FORMATS | {FormatID.BIN}:
+            return self._aff_to_raw(input_path, output_path)
+        # raw → AFF (prepend AFF header)
+        if src_fmt in _RAW_FORMATS | {FormatID.BIN} and tgt_fmt == FormatID.AFF:
+            return self._raw_to_aff(input_path, output_path)
+        # AFF ↔ DUMP/LIME (two-step via raw)
+        if src_fmt == FormatID.AFF and tgt_fmt in {FormatID.DUMP, FormatID.LIME}:
+            return self._aff_to_forensic(input_path, output_path, tgt_fmt)
+        if src_fmt in {FormatID.DUMP, FormatID.LIME} and tgt_fmt == FormatID.AFF:
+            return self._forensic_to_aff(input_path, output_path, src_fmt)
+
         # Forensic → qemu formats: strip header first, then qemu-img
-        if src_fmt in _FORENSIC_FORMATS and tgt_fmt in _QEMU_FORMATS:
+        # Only for DUMP, LIME (EWF/AFF have their own handlers above)
+        if src_fmt in forensic_formats and tgt_fmt in _QEMU_FORMATS:
             return self._forensic_to_qemu(input_path, output_path, src_fmt, tgt_fmt)
 
         raise NotImplementedError(
@@ -522,6 +562,10 @@ class DiskImageHandler:
                 self._lime_to_raw(input_path, tmp_path)
             elif src_fmt == FormatID.DUMP:
                 self._dump_to_raw(input_path, tmp_path)
+            elif src_fmt in _EWF_FORMATS:
+                self._ewf_to_raw(input_path, tmp_path, src_fmt)
+            elif src_fmt == FormatID.AFF:
+                self._aff_to_raw(input_path, tmp_path)
             else:
                 shutil.copy2(input_path, tmp_path)
 
@@ -541,6 +585,276 @@ class DiskImageHandler:
                 os.remove(tmp_path)
 
         logger.info("Forensic → qemu complete: %s", output_path)
+        return os.path.abspath(output_path)
+
+    # ------------------------------------------------------------------
+    # EWF (EnCase) / Autopsy / Guymager format conversions
+    # ------------------------------------------------------------------
+
+    def _ewf_to_raw(self, input_path: str, output_path: str,
+                    src_fmt: FormatID) -> str:
+        """Strip the EWF file header (624 bytes) and write raw disk data.
+
+        The EWF format stores compressed data in the header section.
+        This is a *simplified* conversion that strips the header region
+        for tools that can handle raw data.  For full EWF decompression
+        with chunk handling, use libewf (``ewfexport``).
+
+        .. note::
+            This strips the 624-byte EWF file header.  The resulting raw
+            output will contain EWF data sections (which may be compressed).
+            For forensic analysis, use ``ewfexport`` from libewf for proper
+            decompression.  This method is useful for quick inspection
+            or conversion to other formats via the raw intermediate.
+        """
+        ewf_info = parse_ewf_header(input_path)
+        if ewf_info is None:
+            raise RuntimeError(
+                f"'{input_path}' does not appear to be a valid EWF file. "
+                f"Expected 'EVF' signature at offset 0."
+            )
+        header_size = ewf_info["header_size"]
+
+        logger.info(
+            "EWF → RAW: stripping %d-byte EWF header (case='%s', %d sections) "
+            "from %s",
+            header_size, ewf_info["case_number"],
+            ewf_info["section_count"], input_path,
+        )
+
+        with open(input_path, "rb") as f_in, open(output_path, "wb") as f_out:
+            f_in.seek(header_size)
+            while True:
+                chunk = f_in.read(_STREAM_CHUNK)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+
+        in_size = os.path.getsize(input_path)
+        out_size = os.path.getsize(output_path)
+        logger.info(
+            "EWF → RAW complete: skipped %d bytes, %d → %d bytes",
+            header_size, in_size, out_size,
+        )
+        return os.path.abspath(output_path)
+
+    def _raw_to_ewf(self, input_path: str, output_path: str,
+                    tgt_fmt: FormatID) -> str:
+        """Prepend an EWF file header to raw disk data.
+
+        .. note::
+            This creates a minimal EWF wrapper — the data sections are
+            stored uncompressed.  For proper EWF compression, use
+            ``ewfacquire`` from libewf.  This method is useful for
+            compatibility with tools that require EWF format.
+        """
+        is_ex01 = (tgt_fmt == FormatID.EX01)
+        header = build_ewf_header(case_number="CONVERTED", is_ex01=is_ex01)
+
+        logger.info(
+            "RAW → %s: prepending %d-byte EWF header to %s",
+            "EX01" if is_ex01 else "E01", len(header), input_path,
+        )
+
+        with open(input_path, "rb") as f_in, open(output_path, "wb") as f_out:
+            f_out.write(header)
+            while True:
+                chunk = f_in.read(_STREAM_CHUNK)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+
+        out_size = os.path.getsize(output_path)
+        logger.info("RAW → %s complete: %d bytes", "EX01" if is_ex01 else "E01", out_size)
+        return os.path.abspath(output_path)
+
+    def _ewf_reheader(self, input_path: str, output_path: str,
+                      src_fmt: FormatID, tgt_fmt: FormatID) -> str:
+        """Re-header an EWF file (E01 ↔ EX01 conversion).
+
+        Strips the source EWF header and prepends a new header for the
+        target format.  The data sections are preserved as-is.
+        """
+        ewf_info = parse_ewf_header(input_path)
+        if ewf_info is None:
+            raise RuntimeError(
+                f"'{input_path}' is not a valid EWF file."
+            )
+
+        is_ex01 = (tgt_fmt == FormatID.EX01)
+        new_header = build_ewf_header(
+            case_number=ewf_info["case_number"], is_ex01=is_ex01,
+        )
+        header_size = ewf_info["header_size"]
+
+        logger.info(
+            "EWF re-header: %s → %s (case='%s')",
+            src_fmt.value, tgt_fmt.value, ewf_info["case_number"],
+        )
+
+        with open(input_path, "rb") as f_in, open(output_path, "wb") as f_out:
+            f_out.write(new_header)
+            f_in.seek(header_size)
+            while True:
+                chunk = f_in.read(_STREAM_CHUNK)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+
+        return os.path.abspath(output_path)
+
+    def _ewf_to_forensic(self, input_path: str, output_path: str,
+                         src_fmt: FormatID, tgt_fmt: FormatID) -> str:
+        """Convert EWF → DUMP or EWF → LIME (two-step via raw)."""
+        with tempfile.NamedTemporaryFile(
+            delete=False, prefix="ewf_forensic_tmp_", suffix=".raw",
+        ) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            self._ewf_to_raw(input_path, tmp_path, src_fmt)
+            if tgt_fmt == FormatID.DUMP:
+                self._raw_to_dump(tmp_path, output_path)
+            else:
+                self._raw_to_lime(tmp_path, output_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        return os.path.abspath(output_path)
+
+    def _forensic_to_ewf(self, input_path: str, output_path: str,
+                         src_fmt: FormatID, tgt_fmt: FormatID) -> str:
+        """Convert DUMP/LIME → EWF (two-step via raw)."""
+        with tempfile.NamedTemporaryFile(
+            delete=False, prefix="forensic_ewf_tmp_", suffix=".raw",
+        ) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            if src_fmt == FormatID.LIME:
+                self._lime_to_raw(input_path, tmp_path)
+            else:
+                self._dump_to_raw(input_path, tmp_path)
+            self._raw_to_ewf(tmp_path, output_path, tgt_fmt)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        return os.path.abspath(output_path)
+
+    # ------------------------------------------------------------------
+    # AFF format conversions
+    # ------------------------------------------------------------------
+
+    def _aff_to_raw(self, input_path: str, output_path: str) -> str:
+        """Strip the AFF file header (36 bytes) and write raw data.
+
+        The AFF header contains metadata about the image (page size,
+        compression info).  The actual page data follows the header.
+
+        .. note::
+            This strips the AFF header only.  AFF pages may be compressed
+            depending on the image.  For proper AFF decompression, use
+            ``affcat`` from AFFLIB.  This method is useful for quick
+            inspection or conversion via raw intermediate.
+        """
+        aff_info = parse_aff_header(input_path)
+        if aff_info is None:
+            raise RuntimeError(
+                f"'{input_path}' does not appear to be a valid AFF file. "
+                f"Expected 'AFF\\x00' magic at offset 0."
+            )
+        header_size = aff_info["header_size"]
+
+        logger.info(
+            "AFF → RAW: stripping %d-byte AFF header (v%d.%d, page_size=%d) "
+            "from %s",
+            header_size, aff_info["major"], aff_info["minor"],
+            aff_info["page_size"], input_path,
+        )
+
+        with open(input_path, "rb") as f_in, open(output_path, "wb") as f_out:
+            f_in.seek(header_size)
+            while True:
+                chunk = f_in.read(_STREAM_CHUNK)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+
+        in_size = os.path.getsize(input_path)
+        out_size = os.path.getsize(output_path)
+        logger.info(
+            "AFF → RAW complete: skipped %d bytes, %d → %d bytes",
+            header_size, in_size, out_size,
+        )
+        return os.path.abspath(output_path)
+
+    def _raw_to_aff(self, input_path: str, output_path: str) -> str:
+        """Prepend an AFF file header to raw data.
+
+        .. note::
+            This creates a minimal AFF wrapper with uncompressed data.
+            For proper AFF compression, use ``affconvert`` or similar
+            tools from AFFLIB.
+        """
+        header = build_aff_header(page_size=4096, major=1, minor=0)
+
+        logger.info(
+            "RAW → AFF: prepending %d-byte AFF header to %s",
+            len(header), input_path,
+        )
+
+        with open(input_path, "rb") as f_in, open(output_path, "wb") as f_out:
+            f_out.write(header)
+            while True:
+                chunk = f_in.read(_STREAM_CHUNK)
+                if not chunk:
+                    break
+                f_out.write(chunk)
+
+        out_size = os.path.getsize(output_path)
+        logger.info("RAW → AFF complete: %d bytes", out_size)
+        return os.path.abspath(output_path)
+
+    def _aff_to_forensic(self, input_path: str, output_path: str,
+                         tgt_fmt: FormatID) -> str:
+        """Convert AFF → DUMP or AFF → LIME (two-step via raw)."""
+        with tempfile.NamedTemporaryFile(
+            delete=False, prefix="aff_forensic_tmp_", suffix=".raw",
+        ) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            self._aff_to_raw(input_path, tmp_path)
+            if tgt_fmt == FormatID.DUMP:
+                self._raw_to_dump(tmp_path, output_path)
+            else:
+                self._raw_to_lime(tmp_path, output_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
+        return os.path.abspath(output_path)
+
+    def _forensic_to_aff(self, input_path: str, output_path: str,
+                         src_fmt: FormatID) -> str:
+        """Convert DUMP/LIME → AFF (two-step via raw)."""
+        with tempfile.NamedTemporaryFile(
+            delete=False, prefix="forensic_aff_tmp_", suffix=".raw",
+        ) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            if src_fmt == FormatID.LIME:
+                self._lime_to_raw(input_path, tmp_path)
+            else:
+                self._dump_to_raw(input_path, tmp_path)
+            self._raw_to_aff(tmp_path, output_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+
         return os.path.abspath(output_path)
 
     # ------------------------------------------------------------------

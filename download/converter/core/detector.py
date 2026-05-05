@@ -76,6 +76,9 @@ class FormatID(enum.Enum):
     # -- forensic / memory dump ------------------------------------------
     DUMP = "dump"
     LIME = "lime"
+    E01 = "e01"
+    EX01 = "ex01"
+    AFF = "aff"
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +117,15 @@ _MAGIC_SIGNATURES: List[Tuple[int, bytes, FormatID]] = [
     (0, b"PAGE",              FormatID.DUMP),
     # LiME (Linux Memory Extractor): "LiME" at offset 0
     (0, b"LiME",              FormatID.LIME),
+    # EWF / EnCase E01: "EVF" signature at offset 0
+    # E01 v1 (legacy): EVF\x09\x0D\x0A\xFF\x00
+    # EX01 v2 (EnCase 8+): EVF\x09\x0D\x0A\xFF\x01
+    (0, b"EVF\x09\x0d\x0a\xff\x00", FormatID.E01),
+    (0, b"EVF\x09\x0d\x0a\xff\x01", FormatID.EX01),
+    # AFF (Advanced Forensics Format): "AFF\x00" at offset 0
+    (0, b"AFF\x00",            FormatID.AFF),
+    # AFF v1b variant: "AFF" followed by version byte 0x01
+    (0, b"AFF\x01",            FormatID.AFF),
 ]
 
 # How many trailing bytes to read for formats with footer magic
@@ -158,6 +170,23 @@ _EXTENSION_MAP: Dict[str, FormatID] = {
     ".dmp":    FormatID.DUMP,   # Windows crash dump alias
     ".vdmp":   FormatID.DUMP,   # VMware dump alias
     ".lime":   FormatID.LIME,
+    # EnCase Expert Witness Format (EWF) — used by Autopsy & Guymager
+    ".e01":    FormatID.E01,
+    ".ex01":   FormatID.EX01,
+    ".ewf":    FormatID.E01,    # generic EWF extension alias
+    ".e02":    FormatID.E01,    # split segments
+    ".e03":    FormatID.E01,
+    ".e04":    FormatID.E01,
+    ".e05":    FormatID.E01,
+    ".e06":    FormatID.E01,
+    ".e07":    FormatID.E01,
+    ".e08":    FormatID.E01,
+    ".e09":    FormatID.E01,
+    ".e10":    FormatID.E01,
+    # Advanced Forensics Format
+    ".aff":    FormatID.AFF,
+    ".afd":    FormatID.AFF,    # AFF data file alias
+    ".afm":    FormatID.AFF,    # AFF metadata alias
 }
 
 # Format -> category
@@ -185,6 +214,9 @@ _FORMAT_CATEGORY: Dict[FormatID, FormatCategory] = {
     FormatID.DMG:      FormatCategory.DISK_IMAGE,
     FormatID.DUMP:     FormatCategory.DISK_IMAGE,
     FormatID.LIME:     FormatCategory.DISK_IMAGE,
+    FormatID.E01:      FormatCategory.DISK_IMAGE,
+    FormatID.EX01:     FormatCategory.DISK_IMAGE,
+    FormatID.AFF:      FormatCategory.DISK_IMAGE,
 }
 
 # Canonical output extensions (for generating default output names)
@@ -212,6 +244,9 @@ _FORMAT_EXT: Dict[FormatID, str] = {
     FormatID.DMG:      ".dmg",
     FormatID.DUMP:     ".dump",
     FormatID.LIME:     ".lime",
+    FormatID.E01:      ".e01",
+    FormatID.EX01:     ".ex01",
+    FormatID.AFF:      ".aff",
 }
 
 
@@ -383,6 +418,223 @@ def detect_format(
         path=abspath,
         file_size=file_size,
     )
+
+
+# ---------------------------------------------------------------------------
+# EWF (EnCase Expert Witness Format) header constants and parsing
+# ---------------------------------------------------------------------------
+# EWF is the forensic disk image format used by EnCase (and Autopsy/Guymager).
+# The format stores disk images in compressed segments (.E01, .E02, ...).
+#
+# EWF file header layout (first 13+ bytes):
+#   Offset  Size  Field
+#   0       3     Signature (b"EVF")
+#   3       1     Version part 1 (0x09)
+#   4       1     Version part 2 (0x0D)
+#   5       1     Version part 3 (0x0A)
+#   6       1     Flags (0xFF)
+#   7       1     Version code: 0x00 = E01 (legacy), 0x01 = EX01 (v8+)
+#   8       16    Segment name / case number (null-padded)
+#   24      4     Section count (uint32 LE)
+#   28      4     Section number (uint32 LE)
+#   32      ...   Padding to 624 bytes
+#   624     ...   First data section follows
+#
+# The first segment (.E01) contains the EWF file header followed by
+# data sections.  Subsequent segments (.E02, .E03, ...) are data-only
+# sections that continue the compressed image data.
+#
+# Reference: libewf (https://github.com/libyal/libewf)
+
+EWF_SIGNATURE = b"EVF"
+EWF_HEADER_SIZE = 13
+EWF_FULL_HEADER_SIZE = 624  # total header + padding
+EWF_VERSION_OFFSET = 7
+EWF_CASE_NUMBER_OFFSET = 8
+EWF_CASE_NUMBER_SIZE = 16
+EWF_SECTION_COUNT_OFFSET = 24
+
+
+def parse_ewf_header(path: str) -> Optional[dict]:
+    """Parse an EWF/E01/EX01 file header and return metadata.
+
+    Returns ``None`` if the file is not a valid EWF image.
+
+    Parameters
+    ----------
+    path : str
+        Path to the EWF file (.e01 / .ex01).
+
+    Returns
+    -------
+    dict | None
+        ``{"version_code": int, "is_ex01": bool, "case_number": str,
+        "section_count": int, "header_size": int}``
+    """
+    try:
+        with open(path, "rb") as fh:
+            header = fh.read(32)
+    except OSError:
+        return None
+
+    if len(header) < EWF_HEADER_SIZE:
+        return None
+    if header[:3] != EWF_SIGNATURE:
+        return None
+
+    version_code = header[EWF_VERSION_OFFSET]
+    is_ex01 = version_code == 0x01
+
+    case_bytes = header[EWF_CASE_NUMBER_OFFSET:
+                     EWF_CASE_NUMBER_OFFSET + EWF_CASE_NUMBER_SIZE]
+    case_number = case_bytes.split(b"\x00")[0].decode("ascii", errors="replace")
+
+    section_count = struct.unpack_from("<I", header, EWF_SECTION_COUNT_OFFSET)[0] \
+        if len(header) >= EWF_SECTION_COUNT_OFFSET + 4 else 0
+
+    return {
+        "version_code": version_code,
+        "is_ex01": is_ex01,
+        "case_number": case_number,
+        "section_count": section_count,
+        "header_size": EWF_FULL_HEADER_SIZE,
+    }
+
+
+def build_ewf_header(
+    case_number: str = "",
+    is_ex01: bool = False,
+) -> bytes:
+    """Build a minimal EWF file header (624 bytes).
+
+    Parameters
+    ----------
+    case_number : str
+        Case identifier string (max 16 ASCII chars).
+    is_ex01 : bool
+        If True, produce EX01 (EnCase v8+) header; otherwise E01.
+
+    Returns
+    -------
+    bytes  — exactly ``EWF_FULL_HEADER_SIZE`` bytes.
+    """
+    header = bytearray(EWF_FULL_HEADER_SIZE)
+    # EWF signature
+    header[0:3] = EWF_SIGNATURE
+    # Version fields
+    header[3] = 0x09
+    header[4] = 0x0D
+    header[5] = 0x0A
+    header[6] = 0xFF
+    header[EWF_VERSION_OFFSET] = 0x01 if is_ex01 else 0x00
+    # Case number (truncated to 16 chars)
+    case_bytes = case_number.encode("ascii", errors="replace")[:EWF_CASE_NUMBER_SIZE]
+    header[EWF_CASE_NUMBER_OFFSET:
+          EWF_CASE_NUMBER_OFFSET + len(case_bytes)] = case_bytes
+    # Section count = 1 (single segment)
+    struct.pack_into("<I", header, EWF_SECTION_COUNT_OFFSET, 1)
+    return bytes(header)
+
+
+# ---------------------------------------------------------------------------
+# AFF (Advanced Forensics Format) header constants and parsing
+# ---------------------------------------------------------------------------
+# AFF is an open-source forensic image format supporting compression,
+# encryption, and metadata.  AFFv1 has a simple page-based layout:
+#
+#   Offset  Size  Field
+#   0       4     Magic (b"AFF\x00" for AFFv1)
+#   4       4     Major version (uint32 BE)
+#   8       4     Minor version (uint32 BE)
+#   12      8     Total size (uint64 BE)
+#   20      8     Compressed size (uint64 BE)
+#   28      8     Page size (uint64 BE, typically 4096)
+#   36      ...   Pages follow (compressed)
+#
+# Reference: AFF Library (https://github.com/sshock/AFFLIB)
+
+AFF_MAGIC = b"AFF\x00"
+AFF_HEADER_SIZE = 36
+AFF_MAJOR_OFFSET = 4
+AFF_MINOR_OFFSET = 8
+AFF_TOTAL_SIZE_OFFSET = 12
+AFF_COMPRESSED_SIZE_OFFSET = 20
+AFF_PAGE_SIZE_OFFSET = 28
+
+
+def parse_aff_header(path: str) -> Optional[dict]:
+    """Parse an AFF file header and return metadata.
+
+    Returns ``None`` if the file is not a valid AFF image.
+
+    Parameters
+    ----------
+    path : str
+        Path to the AFF file (.aff).
+
+    Returns
+    -------
+    dict | None
+        ``{"major": int, "minor": int, "total_size": int,
+        "compressed_size": int, "page_size": int, "header_size": int}``
+    """
+    try:
+        with open(path, "rb") as fh:
+            header = fh.read(AFF_HEADER_SIZE)
+    except OSError:
+        return None
+
+    if len(header) < AFF_HEADER_SIZE:
+        return None
+    if header[:4] != AFF_MAGIC:
+        return None
+
+    major = struct.unpack_from(">I", header, AFF_MAJOR_OFFSET)[0]
+    minor = struct.unpack_from(">I", header, AFF_MINOR_OFFSET)[0]
+    total_size = struct.unpack_from(">Q", header, AFF_TOTAL_SIZE_OFFSET)[0]
+    compressed_size = struct.unpack_from(">Q", header, AFF_COMPRESSED_SIZE_OFFSET)[0]
+    page_size = struct.unpack_from(">Q", header, AFF_PAGE_SIZE_OFFSET)[0]
+
+    return {
+        "major": major,
+        "minor": minor,
+        "total_size": total_size,
+        "compressed_size": compressed_size,
+        "page_size": page_size,
+        "header_size": AFF_HEADER_SIZE,
+    }
+
+
+def build_aff_header(
+    page_size: int = 4096,
+    major: int = 1,
+    minor: int = 0,
+) -> bytes:
+    """Build a minimal AFF file header (36 bytes).
+
+    Parameters
+    ----------
+    page_size : int
+        AFF page size (typically 4096).
+    major : int
+        AFF major version.
+    minor : int
+        AFF minor version.
+
+    Returns
+    -------
+    bytes  — exactly ``AFF_HEADER_SIZE`` bytes.
+    """
+    header = bytearray(AFF_HEADER_SIZE)
+    header[0:4] = AFF_MAGIC
+    struct.pack_into(">I", header, AFF_MAJOR_OFFSET, major)
+    struct.pack_into(">I", header, AFF_MINOR_OFFSET, minor)
+    # total_size and compressed_size set to 0 — will be updated by the caller
+    # when the actual data is written.
+    struct.pack_into(">Q", header, AFF_TOTAL_SIZE_OFFSET, 0)
+    struct.pack_into(">Q", header, AFF_COMPRESSED_SIZE_OFFSET, 0)
+    struct.pack_into(">Q", header, AFF_PAGE_SIZE_OFFSET, page_size)
+    return bytes(header)
 
 
 def format_from_extension(ext_hint: str) -> Optional[FormatID]:

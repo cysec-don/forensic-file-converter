@@ -137,6 +137,30 @@ def check_all() -> DependencyReport:
             "(compile from source — no package manager install)",
             ["lime"],
         ),
+        (
+            "ewfexport",
+            "Install libewf:  sudo apt install libewf-tools  |  "
+            "brew install libewf",
+            ["e01", "ex01", "ewf"],
+        ),
+        (
+            "ewfacquire",
+            "Install libewf:  sudo apt install libewf-tools  |  "
+            "brew install libewf",
+            ["e01", "ex01", "ewf"],
+        ),
+        (
+            "affcat",
+            "Install AFFLIB:  sudo apt install afflib-tools  |  "
+            "brew install afflib",
+            ["aff", "afd", "afm"],
+        ),
+        (
+            "affconvert",
+            "Install AFFLIB:  sudo apt install afflib-tools  |  "
+            "brew install afflib",
+            ["aff", "afd", "afm"],
+        ),
     ]
 
     for name, hint, formats in definitions:

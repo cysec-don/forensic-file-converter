@@ -49,6 +49,9 @@ from converter.core.detector import (
     _MAGIC_SIGNATURES,
     parse_lime_header, build_lime_header, LIME_HEADER_SIZE_V1,
     parse_dump_header, WIN_DUMP_HEADER_SIZE,
+    parse_ewf_header, build_ewf_header, EWF_FULL_HEADER_SIZE,
+    EWF_HEADER_SIZE, EWF_SIGNATURE,
+    parse_aff_header, build_aff_header, AFF_HEADER_SIZE, AFF_MAGIC,
 )
 from converter.core.dispatcher import (
     Dispatcher, ConversionSupport, UnsupportedConversion,
@@ -1127,6 +1130,572 @@ class TestEdgeCases(_TempDirTestCase):
         df = all_disk_formats()
         self.assertIn(FormatID.LIME, df)
         self.assertIn(FormatID.DUMP, df)
+
+    # --- EWF (EnCase) / Autopsy / Guymager format detection ---------------
+
+    def test_extension_e01(self):
+        path = self.write_file("disk.e01", b"\x00" * 100)
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.E01)
+        self.assertEqual(info.detected_by, "extension")
+
+    def test_extension_ex01(self):
+        path = self.write_file("disk.ex01", b"\x00" * 100)
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.EX01)
+        self.assertEqual(info.detected_by, "extension")
+
+    def test_extension_ewf_alias(self):
+        path = self.write_file("disk.ewf", b"\x00" * 100)
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.E01)
+
+    def test_extension_e02_split_segment(self):
+        path = self.write_file("disk.e02", b"\x00" * 100)
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.E01)
+
+    def test_magic_e01(self):
+        header = build_ewf_header(case_number="TEST", is_ex01=False)
+        path = self.write_file("disk.dat", header + b"\x00" * 100)
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.E01)
+        self.assertEqual(info.detected_by, "magic")
+
+    def test_magic_ex01(self):
+        header = build_ewf_header(case_number="TEST", is_ex01=True)
+        path = self.write_file("disk.dat", header + b"\x00" * 100)
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.EX01)
+        self.assertEqual(info.detected_by, "magic")
+
+    def test_ewf_category_is_disk_image(self):
+        self.assertEqual(get_category(FormatID.E01), FormatCategory.DISK_IMAGE)
+        self.assertEqual(get_category(FormatID.EX01), FormatCategory.DISK_IMAGE)
+
+    def test_ewf_extension_in_all_disk(self):
+        df = all_disk_formats()
+        self.assertIn(FormatID.E01, df)
+        self.assertIn(FormatID.EX01, df)
+
+    # --- AFF format detection -------------------------------------------
+
+    def test_extension_aff(self):
+        path = self.write_file("disk.aff", b"\x00" * 100)
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.AFF)
+        self.assertEqual(info.detected_by, "extension")
+
+    def test_extension_afd_alias(self):
+        path = self.write_file("disk.afd", b"\x00" * 100)
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.AFF)
+
+    def test_magic_aff(self):
+        header = build_aff_header(page_size=4096, major=1, minor=0)
+        path = self.write_file("disk.dat", header + b"\x00" * 100)
+        info = detect_format(path)
+        self.assertEqual(info.format_id, FormatID.AFF)
+        self.assertEqual(info.detected_by, "magic")
+
+    def test_aff_category_is_disk_image(self):
+        self.assertEqual(get_category(FormatID.AFF), FormatCategory.DISK_IMAGE)
+
+    def test_aff_extension_in_all_disk(self):
+        df = all_disk_formats()
+        self.assertIn(FormatID.AFF, df)
+
+
+# ============================================================================
+# EWF Header Parsing Tests
+# ============================================================================
+
+class TestEwfHeader(_TempDirTestCase):
+
+    def test_build_ewf_header_size(self):
+        header = build_ewf_header()
+        self.assertEqual(len(header), EWF_FULL_HEADER_SIZE)
+
+    def test_build_ewf_header_magic(self):
+        header = build_ewf_header(case_number="CASE1")
+        self.assertEqual(header[:3], EWF_SIGNATURE)
+
+    def test_build_ewf_header_ex01_flag(self):
+        header = build_ewf_header(is_ex01=True)
+        self.assertEqual(header[7], 0x01)
+        header2 = build_ewf_header(is_ex01=False)
+        self.assertEqual(header2[7], 0x00)
+
+    def test_build_ewf_header_case_number(self):
+        header = build_ewf_header(case_number="MYCASE")
+        case_bytes = header[8:24]
+        self.assertTrue(case_bytes.startswith(b"MYCASE"))
+
+    def test_parse_ewf_header_valid_e01(self):
+        original = build_ewf_header(case_number="TEST123", is_ex01=False)
+        payload = b"\xDE\xAD" * 200
+        path = self.write_file("disk.e01", original + payload)
+        info = parse_ewf_header(path)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["version_code"], 0x00)
+        self.assertFalse(info["is_ex01"])
+        self.assertEqual(info["case_number"], "TEST123")
+        self.assertGreaterEqual(info["section_count"], 1)
+        self.assertEqual(info["header_size"], EWF_FULL_HEADER_SIZE)
+
+    def test_parse_ewf_header_valid_ex01(self):
+        original = build_ewf_header(case_number="CASEX", is_ex01=True)
+        payload = b"\xCA\xFE" * 200
+        path = self.write_file("disk.ex01", original + payload)
+        info = parse_ewf_header(path)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["version_code"], 0x01)
+        self.assertTrue(info["is_ex01"])
+
+    def test_parse_ewf_header_too_short(self):
+        path = self.write_file("short.e01", b"EVF\x09")
+        info = parse_ewf_header(path)
+        self.assertIsNone(info)
+
+    def test_parse_ewf_header_wrong_magic(self):
+        path = self.write_file("notewf.dat", b"\x00" * 50)
+        info = parse_ewf_header(path)
+        self.assertIsNone(info)
+
+    def test_parse_ewf_header_nonexistent(self):
+        info = parse_ewf_header("/nonexistent/file.e01")
+        self.assertIsNone(info)
+
+    def test_ewf_roundtrip_build_parse(self):
+        header = build_ewf_header(case_number="RT", is_ex01=True)
+        path = self.write_file("rt.ex01", header + b"\x00" * 200)
+        parsed = parse_ewf_header(path)
+        self.assertEqual(parsed["version_code"], 0x01)
+        self.assertTrue(parsed["is_ex01"])
+        self.assertEqual(parsed["case_number"], "RT")
+
+
+# ============================================================================
+# AFF Header Parsing Tests
+# ============================================================================
+
+class TestAffHeader(_TempDirTestCase):
+
+    def test_build_aff_header_size(self):
+        header = build_aff_header()
+        self.assertEqual(len(header), AFF_HEADER_SIZE)
+
+    def test_build_aff_header_magic(self):
+        header = build_aff_header(page_size=4096)
+        self.assertEqual(header[:4], AFF_MAGIC)
+
+    def test_build_aff_header_page_size(self):
+        header = build_aff_header(page_size=8192)
+        page_size = struct.unpack_from(">Q", header, 28)[0]
+        self.assertEqual(page_size, 8192)
+
+    def test_build_aff_header_version(self):
+        header = build_aff_header(major=2, minor=1)
+        major = struct.unpack_from(">I", header, 4)[0]
+        minor = struct.unpack_from(">I", header, 8)[0]
+        self.assertEqual(major, 2)
+        self.assertEqual(minor, 1)
+
+    def test_parse_aff_header_valid(self):
+        original = build_aff_header(page_size=4096, major=1, minor=0)
+        payload = b"\xDE\xAD" * 200
+        path = self.write_file("disk.aff", original + payload)
+        info = parse_aff_header(path)
+        self.assertIsNotNone(info)
+        self.assertEqual(info["major"], 1)
+        self.assertEqual(info["minor"], 0)
+        self.assertEqual(info["page_size"], 4096)
+        self.assertEqual(info["header_size"], AFF_HEADER_SIZE)
+
+    def test_parse_aff_header_too_short(self):
+        path = self.write_file("short.aff", b"AFF\x00\x00")
+        info = parse_aff_header(path)
+        self.assertIsNone(info)
+
+    def test_parse_aff_header_wrong_magic(self):
+        path = self.write_file("notaff.dat", b"\x00" * 50)
+        info = parse_aff_header(path)
+        self.assertIsNone(info)
+
+    def test_parse_aff_header_nonexistent(self):
+        info = parse_aff_header("/nonexistent/file.aff")
+        self.assertIsNone(info)
+
+    def test_aff_roundtrip_build_parse(self):
+        header = build_aff_header(page_size=8192, major=1, minor=5)
+        path = self.write_file("rt.aff", header + b"\x00" * 200)
+        parsed = parse_aff_header(path)
+        self.assertEqual(parsed["major"], 1)
+        self.assertEqual(parsed["minor"], 5)
+        self.assertEqual(parsed["page_size"], 8192)
+
+
+# ============================================================================
+# EWF / AFF Handler Conversion Tests
+# ============================================================================
+
+class TestEwfConversions(_TempDirTestCase):
+    """Test EWF (EnCase/Autopsy/Guymager) format conversions."""
+
+    def setUp(self):
+        super().setUp()
+        self.dispatcher = Dispatcher()
+        self.handler = DiskImageHandler(dispatcher=self.dispatcher)
+
+    def _make_ewf_file(self, name="disk.e01", payload_size=4096,
+                       is_ex01=False, case_number="TEST"):
+        header = build_ewf_header(case_number=case_number, is_ex01=is_ex01)
+        payload = os.urandom(payload_size)
+        return self.write_file(name, header + payload), payload
+
+    # -- E01 → RAW --------------------------------------------------------
+
+    def test_e01_to_raw_strips_header(self):
+        ewf_path, payload = self._make_ewf_file(payload_size=8192)
+        out = self.tmpfile("mem.raw")
+        result = self.handler.convert(
+            ewf_path, out, target_fmt=FormatID.RAW, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        self.assertEqual(os.path.getsize(result), 8192)
+        with open(result, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_e01_to_dd(self):
+        ewf_path, payload = self._make_ewf_file(payload_size=1024)
+        out = self.tmpfile("mem.dd")
+        result = self.handler.convert(
+            ewf_path, out, target_fmt=FormatID.DD, overwrite=True,
+        )
+        self.assertEqual(os.path.getsize(result), 1024)
+
+    def test_e01_to_img(self):
+        ewf_path, payload = self._make_ewf_file(payload_size=1024)
+        out = self.tmpfile("mem.img")
+        result = self.handler.convert(
+            ewf_path, out, target_fmt=FormatID.IMG, overwrite=True,
+        )
+        self.assertEqual(os.path.getsize(result), 1024)
+
+    # -- RAW → E01 --------------------------------------------------------
+
+    def test_raw_to_e01_prepends_header(self):
+        raw_path = self.write_file("mem.raw", os.urandom(4096))
+        out = self.tmpfile("mem.e01")
+        result = self.handler.convert(
+            raw_path, out, target_fmt=FormatID.E01, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        self.assertEqual(os.path.getsize(result), 4096 + EWF_FULL_HEADER_SIZE)
+        with open(result, "rb") as f:
+            magic = f.read(3)
+            self.assertEqual(magic, EWF_SIGNATURE)
+
+    def test_raw_to_ex01(self):
+        raw_path = self.write_file("mem.raw", os.urandom(4096))
+        out = self.tmpfile("mem.ex01")
+        result = self.handler.convert(
+            raw_path, out, target_fmt=FormatID.EX01, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        # EX01 version code at offset 7
+        with open(result, "rb") as f:
+            f.seek(7)
+            self.assertEqual(f.read(1), b"\x01")
+
+    # -- E01 → BIN ---------------------------------------------------------
+
+    def test_e01_to_bin(self):
+        ewf_path, payload = self._make_ewf_file(payload_size=1024)
+        out = self.tmpfile("mem.bin")
+        result = self.handler.convert(
+            ewf_path, out, target_fmt=FormatID.BIN, overwrite=True,
+        )
+        self.assertEqual(os.path.getsize(result), 1024)
+
+    def test_bin_to_e01(self):
+        bin_path = self.write_file("mem.bin", os.urandom(1024))
+        out = self.tmpfile("mem.e01")
+        result = self.handler.convert(
+            bin_path, out, target_fmt=FormatID.E01, overwrite=True,
+        )
+        self.assertEqual(os.path.getsize(result), 1024 + EWF_FULL_HEADER_SIZE)
+
+    # -- E01 ↔ EX01 re-header ----------------------------------------------
+
+    def test_e01_to_ex01_reheader(self):
+        ewf_path, payload = self._make_ewf_file(
+            payload_size=2048, is_ex01=False, case_number="CASE1")
+        out = self.tmpfile("converted.ex01")
+        result = self.handler.convert(
+            ewf_path, out, target_fmt=FormatID.EX01, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        info = parse_ewf_header(result)
+        self.assertIsNotNone(info)
+        self.assertTrue(info["is_ex01"])
+        self.assertEqual(info["case_number"], "CASE1")
+
+    def test_ex01_to_e01_reheader(self):
+        ewf_path, payload = self._make_ewf_file(
+            payload_size=2048, is_ex01=True, case_number="CASE2")
+        out = self.tmpfile("converted.e01")
+        result = self.handler.convert(
+            ewf_path, out, target_fmt=FormatID.E01, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        info = parse_ewf_header(result)
+        self.assertIsNotNone(info)
+        self.assertFalse(info["is_ex01"])
+
+    # -- E01 ↔ DUMP/LIME ---------------------------------------------------
+
+    def test_e01_to_dump(self):
+        ewf_path, payload = self._make_ewf_file(payload_size=2048)
+        out = self.tmpfile("converted.dump")
+        result = self.handler.convert(
+            ewf_path, out, target_fmt=FormatID.DUMP, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        with open(result, "rb") as f:
+            self.assertEqual(f.read(4), b"PAGE")
+
+    def test_dump_to_e01(self):
+        header = bytearray(WIN_DUMP_HEADER_SIZE)
+        header[0:4] = b"PAGE"
+        struct.pack_into("<I", header, 8, 2)
+        payload = os.urandom(2048)
+        dump_path = self.write_file("crash.dump", bytes(header) + payload)
+        out = self.tmpfile("converted.e01")
+        result = self.handler.convert(
+            dump_path, out, target_fmt=FormatID.E01, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        with open(result, "rb") as f:
+            self.assertEqual(f.read(3), EWF_SIGNATURE)
+
+    def test_e01_to_lime(self):
+        ewf_path, payload = self._make_ewf_file(payload_size=2048)
+        out = self.tmpfile("converted.lime")
+        result = self.handler.convert(
+            ewf_path, out, target_fmt=FormatID.LIME, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        with open(result, "rb") as f:
+            self.assertEqual(f.read(4), b"LiME")
+
+    # -- Error cases ------------------------------------------------------
+
+    def test_e01_to_raw_invalid_ewf_file(self):
+        bad = self.write_file("notewf.dat", b"\x00" * 100)
+        out = self.tmpfile("out.raw")
+        with self.assertRaises(RuntimeError):
+            self.handler.convert(
+                bad, out, target_fmt=FormatID.RAW, overwrite=True,
+            )
+
+
+class TestAffConversions(_TempDirTestCase):
+    """Test AFF format conversions."""
+
+    def setUp(self):
+        super().setUp()
+        self.dispatcher = Dispatcher()
+        self.handler = DiskImageHandler(dispatcher=self.dispatcher)
+
+    def _make_aff_file(self, name="disk.aff", payload_size=4096,
+                       page_size=4096):
+        header = build_aff_header(page_size=page_size, major=1, minor=0)
+        payload = os.urandom(payload_size)
+        return self.write_file(name, header + payload), payload
+
+    # -- AFF → RAW --------------------------------------------------------
+
+    def test_aff_to_raw_strips_header(self):
+        aff_path, payload = self._make_aff_file(payload_size=8192)
+        out = self.tmpfile("mem.raw")
+        result = self.handler.convert(
+            aff_path, out, target_fmt=FormatID.RAW, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        self.assertEqual(os.path.getsize(result), 8192)
+        with open(result, "rb") as f:
+            self.assertEqual(f.read(), payload)
+
+    def test_aff_to_dd(self):
+        aff_path, payload = self._make_aff_file(payload_size=1024)
+        out = self.tmpfile("mem.dd")
+        result = self.handler.convert(
+            aff_path, out, target_fmt=FormatID.DD, overwrite=True,
+        )
+        self.assertEqual(os.path.getsize(result), 1024)
+
+    # -- RAW → AFF --------------------------------------------------------
+
+    def test_raw_to_aff_prepends_header(self):
+        raw_path = self.write_file("mem.raw", os.urandom(4096))
+        out = self.tmpfile("mem.aff")
+        result = self.handler.convert(
+            raw_path, out, target_fmt=FormatID.AFF, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        self.assertEqual(os.path.getsize(result), 4096 + AFF_HEADER_SIZE)
+        with open(result, "rb") as f:
+            magic = f.read(4)
+            self.assertEqual(magic, AFF_MAGIC)
+
+    # -- AFF ↔ BIN ---------------------------------------------------------
+
+    def test_aff_to_bin(self):
+        aff_path, payload = self._make_aff_file(payload_size=1024)
+        out = self.tmpfile("mem.bin")
+        result = self.handler.convert(
+            aff_path, out, target_fmt=FormatID.BIN, overwrite=True,
+        )
+        self.assertEqual(os.path.getsize(result), 1024)
+
+    def test_bin_to_aff(self):
+        bin_path = self.write_file("mem.bin", os.urandom(1024))
+        out = self.tmpfile("mem.aff")
+        result = self.handler.convert(
+            bin_path, out, target_fmt=FormatID.AFF, overwrite=True,
+        )
+        self.assertEqual(os.path.getsize(result), 1024 + AFF_HEADER_SIZE)
+
+    # -- AFF ↔ DUMP/LIME ---------------------------------------------------
+
+    def test_aff_to_dump(self):
+        aff_path, payload = self._make_aff_file(payload_size=2048)
+        out = self.tmpfile("converted.dump")
+        result = self.handler.convert(
+            aff_path, out, target_fmt=FormatID.DUMP, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        with open(result, "rb") as f:
+            self.assertEqual(f.read(4), b"PAGE")
+
+    def test_dump_to_aff(self):
+        header = bytearray(WIN_DUMP_HEADER_SIZE)
+        header[0:4] = b"PAGE"
+        struct.pack_into("<I", header, 8, 2)
+        payload = os.urandom(2048)
+        dump_path = self.write_file("crash.dump", bytes(header) + payload)
+        out = self.tmpfile("converted.aff")
+        result = self.handler.convert(
+            dump_path, out, target_fmt=FormatID.AFF, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        with open(result, "rb") as f:
+            self.assertEqual(f.read(4), AFF_MAGIC)
+
+    def test_aff_to_lime(self):
+        aff_path, payload = self._make_aff_file(payload_size=2048)
+        out = self.tmpfile("converted.lime")
+        result = self.handler.convert(
+            aff_path, out, target_fmt=FormatID.LIME, overwrite=True,
+        )
+        self.assertTrue(os.path.isfile(result))
+        with open(result, "rb") as f:
+            self.assertEqual(f.read(4), b"LiME")
+
+    # -- Error cases ------------------------------------------------------
+
+    def test_aff_to_raw_invalid_aff_file(self):
+        bad = self.write_file("notaff.dat", b"\x00" * 100)
+        out = self.tmpfile("out.raw")
+        with self.assertRaises(RuntimeError):
+            self.handler.convert(
+                bad, out, target_fmt=FormatID.RAW, overwrite=True,
+            )
+
+
+# ============================================================================
+# Dispatcher: EWF/AFF Matrix Tests
+# ============================================================================
+
+class TestEwfAffDispatcher(_TempDirTestCase):
+    """Test conversion matrix entries for EWF and AFF formats."""
+
+    def setUp(self):
+        super().setUp()
+        self.dispatcher = Dispatcher()
+
+    def test_e01_to_raw_supported(self):
+        entry = get_conversion_entry(FormatID.E01, FormatID.RAW)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_ex01_to_raw_supported(self):
+        entry = get_conversion_entry(FormatID.EX01, FormatID.RAW)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_raw_to_e01_supported(self):
+        entry = get_conversion_entry(FormatID.RAW, FormatID.E01)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_raw_to_ex01_supported(self):
+        entry = get_conversion_entry(FormatID.RAW, FormatID.EX01)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_e01_to_ex01_supported(self):
+        entry = get_conversion_entry(FormatID.E01, FormatID.EX01)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_ex01_to_e01_supported(self):
+        entry = get_conversion_entry(FormatID.EX01, FormatID.E01)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_e01_to_dump_supported(self):
+        entry = get_conversion_entry(FormatID.E01, FormatID.DUMP)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_e01_to_lime_supported(self):
+        entry = get_conversion_entry(FormatID.E01, FormatID.LIME)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_dump_to_e01_supported(self):
+        entry = get_conversion_entry(FormatID.DUMP, FormatID.E01)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_lime_to_e01_supported(self):
+        entry = get_conversion_entry(FormatID.LIME, FormatID.E01)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_e01_to_qcow2_supported(self):
+        entry = get_conversion_entry(FormatID.E01, FormatID.QCOW2)
+        self.assertEqual(entry.support, ConversionSupport.EXTERNAL)
+
+    def test_aff_to_raw_supported(self):
+        entry = get_conversion_entry(FormatID.AFF, FormatID.RAW)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_raw_to_aff_supported(self):
+        entry = get_conversion_entry(FormatID.RAW, FormatID.AFF)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_aff_to_dump_supported(self):
+        entry = get_conversion_entry(FormatID.AFF, FormatID.DUMP)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_aff_to_lime_supported(self):
+        entry = get_conversion_entry(FormatID.AFF, FormatID.LIME)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_aff_to_e01_supported(self):
+        entry = get_conversion_entry(FormatID.AFF, FormatID.E01)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_e01_to_aff_supported(self):
+        entry = get_conversion_entry(FormatID.E01, FormatID.AFF)
+        self.assertEqual(entry.support, ConversionSupport.PARTIAL)
+
+    def test_aff_to_qcow2_supported(self):
+        entry = get_conversion_entry(FormatID.AFF, FormatID.QCOW2)
+        self.assertEqual(entry.support, ConversionSupport.EXTERNAL)
 
 
 # ============================================================================

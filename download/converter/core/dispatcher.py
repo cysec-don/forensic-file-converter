@@ -118,6 +118,10 @@ def _build_conversion_matrix() -> Dict[Tuple[FormatID, FormatID], ConversionEntr
     # stripped (→ raw) or inserted (← raw) during conversion.
     forensic_formats = [FormatID.DUMP, FormatID.LIME]
 
+    # EWF (EnCase) / Autopsy / Guymager formats
+    ewf_formats = [FormatID.E01, FormatID.EX01]
+    all_forensic = forensic_formats + ewf_formats + [FormatID.AFF]
+
     for src in qemu_formats:
         for tgt in qemu_formats:
             if src != tgt:
@@ -212,6 +216,96 @@ def _build_conversion_matrix() -> Dict[Tuple[FormatID, FormatID], ConversionEntr
                  f"Header is stripped first; raw memory is wrapped as a "
                  f"raw disk image.",
                  requires_tool="qemu-img")
+
+    # -- EWF (EnCase) / Autopsy / Guymager ↔ Raw & Forensic --------------------
+
+    # E01/EX01 ↔ Raw
+    for ewf_fmt in ewf_formats:
+        for raw_fmt in raw_formats:
+            _add(ewf_fmt, raw_fmt, ConversionSupport.PARTIAL,
+                 f"EWF ({ewf_fmt.value}) → raw: strip EWF file header. "
+                 f"Data sections may still be EWF-compressed; use ewfexport "
+                 f"from libewf for full decompression.")
+            _add(raw_fmt, ewf_fmt, ConversionSupport.PARTIAL,
+                 f"raw → {ewf_fmt.value}: prepend EWF header. "
+                 f"Data is stored uncompressed in a minimal EWF wrapper. "
+                 f"For proper EWF compression, use ewfacquire from libewf.")
+
+    # E01/EX01 ↔ BIN
+    for ewf_fmt in ewf_formats:
+        _add(ewf_fmt, FormatID.BIN, ConversionSupport.PARTIAL,
+             f"EWF ({ewf_fmt.value}) → BIN: strip EWF header.")
+        _add(FormatID.BIN, ewf_fmt, ConversionSupport.PARTIAL,
+             f"BIN → {ewf_fmt.value}: prepend EWF header.")
+
+    # E01 ↔ EX01 (re-header)
+    _add(FormatID.E01, FormatID.EX01, ConversionSupport.PARTIAL,
+         "E01 → EX01: strip E01 header, prepend EX01 header. "
+         "Data sections are preserved. Use for format migration.")
+    _add(FormatID.EX01, FormatID.E01, ConversionSupport.PARTIAL,
+         "EX01 → E01: strip EX01 header, prepend E01 header. "
+         "Data sections are preserved. Use for backward compatibility.")
+
+    # E01/EX01 ↔ DUMP/LIME (two-step via raw)
+    for ewf_fmt in ewf_formats:
+        for fore_fmt in forensic_formats:
+            _add(ewf_fmt, fore_fmt, ConversionSupport.PARTIAL,
+                 f"EWF ({ewf_fmt.value}) → {fore_fmt.value}: strip EWF header, "
+                 f"wrap in {fore_fmt.value} header via raw intermediate. "
+                 f"Metadata is lost; raw data is preserved.")
+            _add(fore_fmt, ewf_fmt, ConversionSupport.PARTIAL,
+                 f"{fore_fmt.value} → EWF ({ewf_fmt.value}): strip {fore_fmt.value} "
+                 f"header, wrap in EWF header via raw intermediate.")
+
+    # E01/EX01 ↔ qemu (via raw)
+    for ewf_fmt in ewf_formats:
+        for q_fmt in qemu_formats:
+            _add(ewf_fmt, q_fmt, ConversionSupport.EXTERNAL,
+                 f"EWF ({ewf_fmt.value}) → {q_fmt.value} via qemu-img. "
+                 f"EWF header is stripped first; raw data is converted "
+                 f"to VM format.",
+                 requires_tool="qemu-img")
+
+    # -- AFF ↔ Raw & Forensic -----------------------------------------------
+
+    # AFF ↔ Raw
+    for raw_fmt in raw_formats:
+        _add(FormatID.AFF, raw_fmt, ConversionSupport.PARTIAL,
+             "AFF → raw: strip AFF header. Pages may be compressed; "
+             "use affcat from AFFLIB for full decompression.")
+        _add(raw_fmt, FormatID.AFF, ConversionSupport.PARTIAL,
+             "raw → AFF: prepend AFF header with uncompressed data. "
+             "For proper AFF compression, use affconvert from AFFLIB.")
+
+    # AFF ↔ BIN
+    _add(FormatID.AFF, FormatID.BIN, ConversionSupport.PARTIAL,
+         "AFF → BIN: strip AFF header.")
+    _add(FormatID.BIN, FormatID.AFF, ConversionSupport.PARTIAL,
+         "BIN → AFF: prepend AFF header.")
+
+    # AFF ↔ DUMP/LIME
+    for fore_fmt in forensic_formats:
+        _add(FormatID.AFF, fore_fmt, ConversionSupport.PARTIAL,
+             f"AFF → {fore_fmt.value}: strip AFF header, wrap in {fore_fmt.value} "
+             f"header via raw intermediate. Metadata is lost.")
+        _add(fore_fmt, FormatID.AFF, ConversionSupport.PARTIAL,
+             f"{fore_fmt.value} → AFF: strip {fore_fmt.value} header, wrap in "
+             f"AFF header via raw intermediate.")
+
+    # AFF ↔ E01/EX01
+    for ewf_fmt in ewf_formats:
+        _add(FormatID.AFF, ewf_fmt, ConversionSupport.PARTIAL,
+             f"AFF → {ewf_fmt.value}: strip AFF header, wrap in EWF header. "
+             f"Both are forensic formats; this converts the container.")
+        _add(ewf_fmt, FormatID.AFF, ConversionSupport.PARTIAL,
+             f"{ewf_fmt.value} → AFF: strip EWF header, wrap in AFF header. "
+             f"Both are forensic formats; this converts the container.")
+
+    # AFF ↔ qemu
+    for q_fmt in qemu_formats:
+        _add(FormatID.AFF, q_fmt, ConversionSupport.EXTERNAL,
+             f"AFF → {q_fmt.value} via qemu-img. AFF header is stripped first.",
+             requires_tool="qemu-img")
 
     return matrix
 
